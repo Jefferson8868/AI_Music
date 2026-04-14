@@ -1,0 +1,21 @@
+fastapi
+uvicorn[standard]
+pydantic>=2.0
+pydantic-settings
+httpx
+music21
+mido
+python-rtmidi
+python-multipart
+websockets
+loguru
+
+# AutoGen (installed via editable mode from ./autogen/)
+# pip install -e ./autogen/python/packages/autogen-core
+# pip install -e ./autogen/python/packages/autogen-agentchat
+# pip install -e ./autogen/python/packages/autogen-ext[openai]
+
+# LLM API clients
+openai
+anthropic
+google-generativeai

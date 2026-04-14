@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.egg-info/
+.env
+output/
+models/*.mag
+.cursor/
+resources/
+reaimgui/
+autogen/
