@@ -41,7 +41,10 @@ class Settings(BaseSettings):
     critic_regen_threshold: float = 0.5
     agent_timeout: float = 120.0
 
-    model_config = {"env_prefix": "MG_", "env_file": ".env"}
+    model_config = {
+        "env_prefix": "MG_",
+        "env_file": Path(__file__).parent.parent / ".env",
+    }
 
 
 settings = Settings()
