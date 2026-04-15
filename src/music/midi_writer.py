@@ -8,7 +8,11 @@ from __future__ import annotations
 from pathlib import Path
 import mido
 import mido.midifiles.meta
-mido.midifiles.meta._charset = 'utf-8'
+
+_orig_encode = mido.midifiles.meta.encode_string
+def _utf8_encode_string(string):
+    return list(bytearray(string.encode('utf-8')))
+mido.midifiles.meta.encode_string = _utf8_encode_string
 
 from src.music.models import Arrangement, Track, Note, ArticulationType
 
