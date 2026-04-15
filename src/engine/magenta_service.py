@@ -109,28 +109,40 @@ def _extract_notes(sequence):
 
 @app.post("/generate_melody")
 def generate_melody(req: GenRequest):
-    _init_generators()
+    try:
+        _init_generators()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Model init failed: {e}")
     if _melody_generator is None:
         raise HTTPException(status_code=503, detail="Melody model not loaded")
-    primer = _build_primer(req.primer_notes, req.qpm)
-    options = _build_options(primer, req.num_steps, req.temperature, req.qpm)
-    result = _melody_generator.generate(primer, options)
-    path = _save_midi(result, "melody")
-    notes = _extract_notes(result)
-    return {"midi_path": str(path), "notes": notes, "duration_seconds": round(result.total_time, 2)}
+    try:
+        primer = _build_primer(req.primer_notes, req.qpm)
+        options = _build_options(primer, req.num_steps, req.temperature, req.qpm)
+        result = _melody_generator.generate(primer, options)
+        path = _save_midi(result, "melody")
+        notes = _extract_notes(result)
+        return {"midi_path": str(path), "notes": notes, "duration_seconds": round(result.total_time, 2)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Melody generation failed: {e}")
 
 
 @app.post("/generate_polyphony")
 def generate_polyphony(req: GenRequest):
-    _init_generators()
+    try:
+        _init_generators()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Model init failed: {e}")
     if _poly_generator is None:
         raise HTTPException(status_code=503, detail="Polyphony model not loaded")
-    primer = _build_primer(req.primer_notes, req.qpm)
-    options = _build_options(primer, req.num_steps, req.temperature, req.qpm)
-    result = _poly_generator.generate(primer, options)
-    path = _save_midi(result, "polyphony")
-    notes = _extract_notes(result)
-    return {"midi_path": str(path), "notes": notes, "duration_seconds": round(result.total_time, 2)}
+    try:
+        primer = _build_primer(req.primer_notes, req.qpm)
+        options = _build_options(primer, req.num_steps, req.temperature, req.qpm)
+        result = _poly_generator.generate(primer, options)
+        path = _save_midi(result, "polyphony")
+        notes = _extract_notes(result)
+        return {"midi_path": str(path), "notes": notes, "duration_seconds": round(result.total_time, 2)}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Polyphony generation failed: {e}")
 
 
 @app.get("/health")

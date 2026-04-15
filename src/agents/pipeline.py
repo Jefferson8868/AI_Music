@@ -37,6 +37,38 @@ from config.settings import settings
 ProgressCallback = Callable[[str, str, float], Awaitable[None]]
 
 
+def _find_json_objects(text: str) -> list[dict]:
+    """Extract all top-level JSON objects from a text string."""
+    import re
+    text = re.sub(r'```(?:json)?\s*', '', text)
+    text = re.sub(r'```', '', text)
+    results = []
+    i = 0
+    while i < len(text):
+        if text[i] == '{':
+            depth = 0
+            start = i
+            for j in range(i, len(text)):
+                if text[j] == '{':
+                    depth += 1
+                elif text[j] == '}':
+                    depth -= 1
+                    if depth == 0:
+                        try:
+                            obj = json.loads(text[start:j + 1])
+                            if isinstance(obj, dict):
+                                results.append(obj)
+                        except json.JSONDecodeError:
+                            pass
+                        i = j + 1
+                        break
+            else:
+                i += 1
+        else:
+            i += 1
+    return results
+
+
 class MusicGenerationPipeline:
     """
     Initializes all agents and the SelectorGroupChat team,
@@ -191,18 +223,131 @@ class MusicGenerationPipeline:
 
     @staticmethod
     def _extract_score(messages: list[dict]) -> Score | None:
-        """Walk messages backwards looking for the latest Score JSON."""
-        for msg in reversed(messages):
+        """Reconstruct a Score from agent conversation messages.
+
+        Parses orchestrator blueprint (metadata), composer edits (notes),
+        and instrumentalist assignments (tracks/instruments) to build
+        a complete Score suitable for MIDI export.
+        """
+        from src.music.score import ScoreNote, ScoreSection, ScoreTrack
+
+        title, key, scale_type = "Untitled", "C", "major"
+        tempo, time_sig = 120, [4, 4]
+        blueprint_sections: list[dict] = []
+        all_notes: dict[str, list[dict]] = {}
+        track_instruments: dict[str, dict] = {}
+
+        for msg in messages:
             text = msg.get("content", "")
-            try:
-                start = text.index("{")
-                end = text.rindex("}") + 1
-                data = json.loads(text[start:end])
-                if "tracks" in data and "sections" in data:
-                    return Score(**data)
-            except (ValueError, json.JSONDecodeError, Exception):
-                continue
-        return None
+            source = msg.get("source", "")
+            json_blocks = _find_json_objects(text)
+
+            if source == "orchestrator":
+                for data in json_blocks:
+                    title = data.get("title", title)
+                    key = data.get("key", key)
+                    scale_type = data.get("scale_type", scale_type)
+                    tempo = data.get("tempo", tempo)
+                    time_sig = data.get("time_signature", time_sig)
+                    for sec in data.get("sections", []):
+                        if isinstance(sec, dict) and "name" in sec:
+                            blueprint_sections.append(sec)
+
+            elif source == "composer":
+                for data in json_blocks:
+                    edits = data.get("edits", [])
+                    if not isinstance(edits, list):
+                        continue
+                    for edit in edits:
+                        if not isinstance(edit, dict):
+                            continue
+                        if edit.get("action", "add") not in ("add", "modify"):
+                            continue
+                        pitch = edit.get("pitch")
+                        start = edit.get("start_beat")
+                        dur = edit.get("duration_beats")
+                        if pitch is None or start is None or dur is None:
+                            continue
+                        track_name = edit.get("track", "melody")
+                        all_notes.setdefault(track_name, []).append({
+                            "pitch": int(pitch),
+                            "start_beat": float(start),
+                            "duration_beats": float(dur),
+                            "velocity": min(127, max(1, int(edit.get("velocity", 80)))),
+                        })
+
+            elif source == "instrumentalist":
+                for data in json_blocks:
+                    for trk in data.get("tracks", []):
+                        if isinstance(trk, dict) and "instrument" in trk:
+                            track_instruments[trk["instrument"]] = {
+                                "instrument": trk.get("instrument", "Piano"),
+                                "role": trk.get("role", "accompaniment"),
+                                "channel": int(trk.get("midi_channel", 0)),
+                                "program": int(trk.get("program_number", 0)),
+                            }
+
+        if not all_notes:
+            logger.warning("No note data found in any composer message")
+            return None
+
+        beats_per_bar = time_sig[0] if time_sig else 4
+        sections: list[ScoreSection] = []
+        beat_offset = 0.0
+        if blueprint_sections:
+            for sd in blueprint_sections:
+                bars = int(sd.get("bars", 4))
+                sections.append(ScoreSection(
+                    name=sd["name"], start_beat=beat_offset, bars=bars,
+                ))
+                beat_offset += bars * beats_per_bar
+        else:
+            max_beat = max(
+                max(n["start_beat"] + n["duration_beats"] for n in ns)
+                for ns in all_notes.values()
+            )
+            sections.append(ScoreSection(
+                name="main", start_beat=0.0,
+                bars=int(max_beat / beats_per_bar) + 1,
+            ))
+
+        tracks: list[ScoreTrack] = []
+        inst_list = list(track_instruments.values())
+        for idx, (track_name, notes) in enumerate(all_notes.items()):
+            matched = None
+            tn_lower = track_name.lower().replace("_", " ")
+            for inst in inst_list:
+                if (tn_lower in inst["instrument"].lower()
+                        or inst["instrument"].lower() in tn_lower
+                        or inst["role"].lower() in tn_lower):
+                    matched = inst
+                    break
+            if matched is None and idx < len(inst_list):
+                matched = inst_list[idx]
+
+            score_notes = sorted(
+                [ScoreNote(**n) for n in notes],
+                key=lambda n: n.start_beat,
+            )
+            tracks.append(ScoreTrack(
+                name=track_name,
+                instrument=matched["instrument"] if matched else track_name,
+                role=matched["role"] if matched else "melody",
+                channel=matched["channel"] if matched else idx,
+                program=matched["program"] if matched else 0,
+                notes=score_notes,
+            ))
+
+        total_notes = sum(len(t.notes) for t in tracks)
+        logger.info(
+            f"Score reconstructed: '{title}', {len(tracks)} tracks, "
+            f"{total_notes} notes, {len(sections)} sections"
+        )
+        return Score(
+            title=title, key=key, scale_type=scale_type,
+            tempo=tempo, time_signature=time_sig,
+            sections=sections, tracks=tracks,
+        )
 
 
 class PipelineResult:
