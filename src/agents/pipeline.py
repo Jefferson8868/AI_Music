@@ -294,22 +294,9 @@ class MusicGenerationPipeline:
 
         try:
             logger.info("Pipeline: using run_stream to capture live messages")
-            # #region agent log
-            import traceback as _tb
-            from pathlib import Path as _P
-            _LOG_PATH = str(_P(__file__).resolve().parent.parent.parent / "debug-8c5aa2.log")
-            def _dlog(loc, msg, data=None):
-                import json as _j
-                with open(_LOG_PATH, "a") as _f:
-                    _f.write(_j.dumps({"sessionId": "8c5aa2", "location": loc, "message": msg, "data": data or {}, "timestamp": int(time.time()*1000)}) + "\n")
-            _dlog("pipeline.py:run:start", "Pipeline run starting", {"task_len": len(task_description), "backend": settings.llm_backend, "model": settings.llm_model, "log_path": _LOG_PATH})
-            # #endregion
             t0 = time.time()
             messages = []
             msg_count = 0
-            # #region agent log
-            _dlog("pipeline.py:run:before_stream", "About to call run_stream", {"task_preview": task_description[:100], "hypothesisId": "H-B"})
-            # #endregion
             async for event in self.team.run_stream(task=task_description):
                 if hasattr(event, "source"):
                     source = getattr(event, "source", "unknown")
@@ -341,8 +328,9 @@ class MusicGenerationPipeline:
             midi_path = None
             if score:
                 ts = int(time.time())
+                safe_title = score.title.encode("ascii", errors="replace").decode("ascii").replace("?", "_")
                 midi_path = str(
-                    settings.output_dir / f"{score.title}_{ts}.mid"
+                    settings.output_dir / f"{safe_title}_{ts}.mid"
                 )
                 save_score_midi(score, midi_path)
                 logger.info(f"MIDI exported: {midi_path}")
@@ -360,13 +348,8 @@ class MusicGenerationPipeline:
             )
 
         except Exception as e:
-            # #region agent log
-            full_tb = _tb.format_exc()
-            try:
-                _dlog("pipeline.py:run:error", "Pipeline exception", {"error": str(e), "type": type(e).__name__, "traceback": full_tb, "msg_count": msg_count})
-            except Exception:
-                pass
-            # #endregion
+            import traceback
+            full_tb = traceback.format_exc()
             logger.error(f"Pipeline error: {e}\n{full_tb}")
             if self._on_progress:
                 await self._on_progress("error", str(e), 0.0)
