@@ -40,6 +40,7 @@ class Settings(BaseSettings):
     critic_pass_threshold: float = 0.8
     critic_regen_threshold: float = 0.5
     agent_timeout: float = 120.0
+    quantization_grid: float = 0.25
 
     model_config = {
         "env_prefix": "MG_",

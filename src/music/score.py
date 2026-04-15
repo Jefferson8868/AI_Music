@@ -131,7 +131,9 @@ class Score(BaseModel):
 
         return "\n".join(parts)
 
-    def get_section_notes(self, section_name: str, track_name: str) -> list[ScoreNote]:
+    def get_section_notes(
+        self, section_name: str, track_name: str,
+    ) -> list[ScoreNote]:
         sec = next((s for s in self.sections if s.name == section_name), None)
         trk = next((t for t in self.tracks if t.name == track_name), None)
         if not sec or not trk:
@@ -174,7 +176,9 @@ class Score(BaseModel):
 
     @property
     def duration_seconds(self) -> float:
-        return (self.total_beats / self.tempo) * 60.0 if self.tempo > 0 else 0.0
+        if self.tempo > 0:
+            return (self.total_beats / self.tempo) * 60.0
+        return 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -257,3 +261,127 @@ class SynthesisRequest(BaseModel):
     qpm: float = 120.0
     model_type: str = "melody"
     section_name: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# Quantitative metrics (computed by code, never by LLM)
+# ---------------------------------------------------------------------------
+
+def compute_score_metrics(
+    score: Score,
+    enriched_sections: list[dict],
+    lyrics: list[dict] | None = None,
+) -> dict:
+    """Compute exact quantitative metrics for the Critic.
+
+    Returns a dict with total_notes, track_count, per-section breakdowns,
+    section_contrast info, and lyrics_alignment percentage.
+    """
+    metrics: dict = {
+        "total_notes": 0,
+        "track_count": len(score.tracks),
+        "sections": {},
+    }
+
+    section_velocities: dict[str, list[int]] = {}
+
+    for sec_info in enriched_sections:
+        sec_name = sec_info["name"]
+        s = float(sec_info["start_beat"])
+        e = float(sec_info["end_beat"])
+        bars = int(sec_info["bars"])
+        sec_metrics: dict = {
+            "tracks": {}, "total": 0, "bars": bars,
+        }
+
+        for trk in score.tracks:
+            notes = [
+                n for n in trk.notes if s <= n.start_beat < e
+            ]
+            count = len(notes)
+            density = round(count / bars, 1) if bars > 0 else 0
+            pitches = [n.pitch for n in notes]
+            vels = [n.velocity for n in notes]
+            sec_metrics["tracks"][trk.name] = {
+                "note_count": count,
+                "notes_per_bar": density,
+                "pitch_range": (
+                    (min(pitches), max(pitches)) if pitches else None
+                ),
+                "avg_velocity": (
+                    round(sum(vels) / count) if count else 0
+                ),
+            }
+            sec_metrics["total"] += count
+            metrics["total_notes"] += count
+            section_velocities.setdefault(sec_name, []).extend(vels)
+
+        metrics["sections"][sec_name] = sec_metrics
+
+    avg_vels = {
+        name: round(sum(v) / len(v)) if v else 0
+        for name, v in section_velocities.items()
+    }
+    metrics["section_avg_velocity"] = avg_vels
+
+    if lyrics and score.tracks:
+        melody_trk = next(
+            (t for t in score.tracks
+             if "melody" in t.name.lower() or t.role == "melody"),
+            score.tracks[0],
+        )
+        melody_beats = {n.start_beat for n in melody_trk.notes}
+        total_lyric_beats = 0
+        aligned_beats = 0
+        for block in lyrics:
+            for line in block.get("lines", []):
+                if isinstance(line, dict) and "start_beat" in line:
+                    total_lyric_beats += 1
+                    if float(line["start_beat"]) in melody_beats:
+                        aligned_beats += 1
+        metrics["lyrics_alignment_pct"] = (
+            round(100 * aligned_beats / total_lyric_beats)
+            if total_lyric_beats > 0 else 0
+        )
+    else:
+        metrics["lyrics_alignment_pct"] = 0
+
+    return metrics
+
+
+def format_metrics_for_critic(metrics: dict) -> str:
+    """Format pre-computed metrics into a text block for the Critic."""
+    lines = [
+        "QUANTITATIVE METRICS (computed by system, DO NOT recount):",
+        f"- Total notes: {metrics['total_notes']} "
+        f"across {metrics['track_count']} tracks",
+        "- Section breakdown:",
+    ]
+    for sec_name, sec_data in metrics.get("sections", {}).items():
+        track_parts = []
+        for trk_name, trk_data in sec_data.get("tracks", {}).items():
+            track_parts.append(
+                f"{trk_name}: {trk_data['note_count']} notes "
+                f"({trk_data['notes_per_bar']}/bar)"
+            )
+        lines.append(
+            f"  [{sec_name.upper()}] {sec_data['total']} notes | "
+            + " | ".join(track_parts)
+        )
+
+    avg_vels = metrics.get("section_avg_velocity", {})
+    if avg_vels:
+        contrast_parts = [
+            f"{k}={v}" for k, v in avg_vels.items()
+        ]
+        lines.append(
+            "- Section velocity contrast: " + ", ".join(contrast_parts)
+        )
+
+    alignment = metrics.get("lyrics_alignment_pct", 0)
+    lines.append(
+        f"- Lyrics alignment: {alignment}% of lyric beats "
+        "match melody note positions"
+    )
+
+    return "\n".join(lines)

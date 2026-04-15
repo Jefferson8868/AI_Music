@@ -211,6 +211,8 @@ def score_to_midi(score, ticks_per_beat: int = 480) -> mido.MidiFile:
 
     tempo_track.append(mido.MetaMessage("end_of_track", time=0))
 
+    articulations = getattr(score, '_articulations', {})
+
     for trk in score.tracks:
         midi_track = mido.MidiTrack()
         midi_track.append(mido.MetaMessage(
@@ -225,8 +227,11 @@ def score_to_midi(score, ticks_per_beat: int = 480) -> mido.MidiFile:
 
         events: list[tuple[int, mido.Message]] = []
         for n in trk.notes:
+            dur = n.duration_beats
+            if n.articulation == "staccato":
+                dur = dur * 0.5
             s = _beats_to_ticks(n.start_beat, ticks_per_beat)
-            e = s + _beats_to_ticks(n.duration_beats, ticks_per_beat)
+            e = s + _beats_to_ticks(dur, ticks_per_beat)
             vel = min(127, max(1, n.velocity))
             events.append((s, mido.Message(
                 "note_on", note=n.pitch, velocity=vel, channel=ch,
@@ -234,6 +239,68 @@ def score_to_midi(score, ticks_per_beat: int = 480) -> mido.MidiFile:
             events.append((e, mido.Message(
                 "note_off", note=n.pitch, velocity=0, channel=ch,
             )))
+
+        trk_arts = articulations.get(trk.instrument, [])
+        for art in trk_arts:
+            if not isinstance(art, dict):
+                continue
+            art_type = art.get("type", "")
+            beat_range = art.get("beat_range", [])
+            if len(beat_range) < 2:
+                continue
+            b_start = float(beat_range[0])
+            b_end = float(beat_range[1])
+            t_start = _beats_to_ticks(b_start, ticks_per_beat)
+            t_end = _beats_to_ticks(b_end, ticks_per_beat)
+
+            if art_type == "vibrato":
+                intensity = int(
+                    min(127, max(0, art.get("intensity", 0.5) * 127))
+                )
+                events.append((t_start, mido.Message(
+                    "control_change", control=1, value=intensity,
+                    channel=ch,
+                )))
+                events.append((t_end, mido.Message(
+                    "control_change", control=1, value=0,
+                    channel=ch,
+                )))
+            elif art_type == "pitch_bend":
+                semitones = art.get("semitones", 2)
+                bend_val = min(8191, max(-8192, int(
+                    semitones * 4096 / 2
+                )))
+                events.append((t_start, mido.Message(
+                    "pitchwheel", pitch=bend_val, channel=ch,
+                )))
+                events.append((t_end, mido.Message(
+                    "pitchwheel", pitch=0, channel=ch,
+                )))
+            elif art_type == "glissando":
+                steps = 16
+                dur_ticks = t_end - t_start
+                direction = 1 if art.get("direction", "up") == "up" else -1
+                for i in range(steps):
+                    t = t_start + (dur_ticks * i // steps)
+                    bend = int(direction * 8191 * (i / steps))
+                    events.append((t, mido.Message(
+                        "pitchwheel", pitch=bend, channel=ch,
+                    )))
+                events.append((t_end, mido.Message(
+                    "pitchwheel", pitch=0, channel=ch,
+                )))
+            elif art_type == "tremolo":
+                expr_val = int(
+                    min(127, max(0, art.get("intensity", 0.7) * 127))
+                )
+                events.append((t_start, mido.Message(
+                    "control_change", control=11, value=expr_val,
+                    channel=ch,
+                )))
+                events.append((t_end, mido.Message(
+                    "control_change", control=11, value=127,
+                    channel=ch,
+                )))
 
         events.sort(key=lambda x: x[0])
         prev = 0
@@ -248,10 +315,21 @@ def score_to_midi(score, ticks_per_beat: int = 480) -> mido.MidiFile:
     return mid
 
 
-def save_score_midi(score, path: str | Path) -> Path:
-    """Save a Score as a .mid file."""
+def save_score_midi(
+    score, path: str | Path,
+    articulations: dict[str, list[dict]] | None = None,
+) -> Path:
+    """Save a Score as a .mid file.
+
+    articulations: optional dict mapping instrument name to a list
+    of articulation dicts from the Instrumentalist agent.
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    if articulations:
+        score._articulations = articulations
     mid = score_to_midi(score)
     mid.save(str(path))
+    if hasattr(score, '_articulations'):
+        del score._articulations
     return path
