@@ -45,21 +45,11 @@ class InstrumentalistAgent(BaseChatAgent):
         raw = result.content if isinstance(result.content, str) else str(result.content)
         logger.info(f"[Instrumentalist] LLM responded in {time.time()-t0:.1f}s, {len(raw)} chars")
 
-        if "FINALIZED" not in raw and self._should_finalize(messages):
-            logger.info("[Instrumentalist] critic passed → appending FINALIZED")
+        if "FINALIZED" not in raw:
+            logger.info("[Instrumentalist] appending FINALIZED to complete pipeline")
             raw += "\n\nFINALIZED"
 
         return Response(chat_message=TextMessage(content=f"[Instrumentalist] {raw}", source=self.name))
 
     async def on_reset(self, cancellation_token: CancellationToken) -> None:
         pass
-
-    def _should_finalize(self, messages: Sequence[BaseChatMessage]) -> bool:
-        """Check if the critic has passed and this is the final orchestration round."""
-        for msg in reversed(messages):
-            text = msg.to_text()
-            if '"passes": true' in text or '"passes":true' in text:
-                return True
-            if "[Critic]" in text:
-                break
-        return False

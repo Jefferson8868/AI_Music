@@ -7,6 +7,8 @@ from __future__ import annotations
 
 from pathlib import Path
 import mido
+import mido.midifiles.meta
+mido.midifiles.meta._charset = 'utf-8'
 
 from src.music.models import Arrangement, Track, Note, ArticulationType
 
@@ -152,15 +154,6 @@ def _fix_program(instrument_name: str, program: int) -> int:
     return program
 
 
-def _safe_text(text: str) -> str:
-    """Transliterate or strip non-latin-1 characters so mido can encode them."""
-    try:
-        text.encode("latin-1")
-        return text
-    except UnicodeEncodeError:
-        return text.encode("latin-1", errors="replace").decode("latin-1")
-
-
 def score_to_midi(score, ticks_per_beat: int = 480) -> mido.MidiFile:
     """Convert a Score object to a MIDI file."""
     mid = mido.MidiFile(ticks_per_beat=ticks_per_beat)
@@ -180,7 +173,7 @@ def score_to_midi(score, ticks_per_beat: int = 480) -> mido.MidiFile:
         notated_32nd_notes_per_beat=8, time=0,
     ))
     tempo_track.append(mido.MetaMessage(
-        "track_name", name=_safe_text(score.title), time=0,
+        "track_name", name=score.title, time=0,
     ))
 
     # Add lyrics as meta events on the tempo track
@@ -192,7 +185,7 @@ def score_to_midi(score, ticks_per_beat: int = 480) -> mido.MidiFile:
                     beat = float(lyric.get("beat", sec.start_beat))
                     tick = _beats_to_ticks(beat, ticks_per_beat)
                     lyric_events.append((tick, mido.MetaMessage(
-                        "lyrics", text=_safe_text(lyric["text"]), time=0,
+                        "lyrics", text=lyric["text"], time=0,
                     )))
     if lyric_events:
         lyric_events.sort(key=lambda x: x[0])
@@ -207,7 +200,7 @@ def score_to_midi(score, ticks_per_beat: int = 480) -> mido.MidiFile:
     for trk in score.tracks:
         midi_track = mido.MidiTrack()
         midi_track.append(mido.MetaMessage(
-            "track_name", name=_safe_text(f"{trk.instrument} ({trk.name})"), time=0,
+            "track_name", name=f"{trk.instrument} ({trk.name})", time=0,
         ))
         ch = trk.channel
         program = _fix_program(trk.instrument, trk.program)
