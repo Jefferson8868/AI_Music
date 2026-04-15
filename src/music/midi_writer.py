@@ -131,9 +131,29 @@ def save_midi(arrangement: Arrangement, path: str | Path) -> Path:
 # Score → MIDI (bridges the new Score model to the existing MIDI writer)
 # ---------------------------------------------------------------------------
 
+_CHINESE_GM_MAP = {
+    "guzheng": 107, "古筝": 107, "koto": 107,
+    "erhu": 110, "二胡": 110, "fiddle": 110,
+    "pipa": 106, "琵琶": 106, "shamisen": 106,
+    "dizi": 77, "笛子": 77, "shakuhachi": 77,
+    "xiao": 75, "箫": 75, "pan flute": 75,
+    "yangqin": 15, "扬琴": 15, "dulcimer": 15,
+    "cello": 42, "violin": 40, "viola": 41, "contrabass": 43,
+    "flute": 73, "strings": 48, "pad": 89,
+}
+
+
+def _fix_program(instrument_name: str, program: int) -> int:
+    """Ensure Chinese instruments get correct GM programs."""
+    name = instrument_name.lower()
+    for key, gm_prog in _CHINESE_GM_MAP.items():
+        if key in name:
+            return gm_prog
+    return program
+
+
 def score_to_midi(score, ticks_per_beat: int = 480) -> mido.MidiFile:
     """Convert a Score object to a MIDI file."""
-    from src.music.score import Score
     mid = mido.MidiFile(ticks_per_beat=ticks_per_beat)
 
     tempo_track = mido.MidiTrack()
@@ -154,14 +174,36 @@ def score_to_midi(score, ticks_per_beat: int = 480) -> mido.MidiFile:
         "track_name", name=score.title, time=0,
     ))
 
+    # Add lyrics as meta events on the tempo track
+    lyric_events: list[tuple[int, mido.MetaMessage]] = []
+    for sec in score.sections:
+        if sec.lyrics:
+            for lyric in sec.lyrics:
+                if isinstance(lyric, dict) and "text" in lyric:
+                    beat = float(lyric.get("beat", sec.start_beat))
+                    tick = _beats_to_ticks(beat, ticks_per_beat)
+                    lyric_events.append((tick, mido.MetaMessage(
+                        "lyrics", text=lyric["text"], time=0,
+                    )))
+    if lyric_events:
+        lyric_events.sort(key=lambda x: x[0])
+        prev = 0
+        for tick, meta in lyric_events:
+            meta.time = max(0, tick - prev)
+            tempo_track.append(meta)
+            prev = tick
+
+    tempo_track.append(mido.MetaMessage("end_of_track", time=0))
+
     for trk in score.tracks:
         midi_track = mido.MidiTrack()
         midi_track.append(mido.MetaMessage(
-            "track_name", name=trk.name, time=0,
+            "track_name", name=f"{trk.instrument} ({trk.name})", time=0,
         ))
         ch = trk.channel
+        program = _fix_program(trk.instrument, trk.program)
         midi_track.append(mido.Message(
-            "program_change", program=trk.program,
+            "program_change", program=program,
             channel=ch, time=0,
         ))
 

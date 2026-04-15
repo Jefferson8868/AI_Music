@@ -126,6 +126,118 @@ def _find_json_objects(text: str) -> list[dict]:
     return results
 
 
+def _extract_tracks_from_json(data: dict) -> dict[str, list[dict]] | None:
+    """Extract tracks with notes from a JSON object.
+
+    Handles two formats:
+      Format A: {"tracks": [{"name": "melody", "notes": [...]}]}
+      Format B: {"edits": [{"track": "melody", "pitch": 60, ...}]}
+    Returns {track_name: [note_dicts]} or None.
+    """
+    result: dict[str, list[dict]] = {}
+
+    # Format A: complete score with tracks
+    if "tracks" in data and isinstance(data["tracks"], list):
+        for trk in data["tracks"]:
+            if not isinstance(trk, dict):
+                continue
+            name = trk.get("name", trk.get("instrument", "track"))
+            notes_raw = trk.get("notes", [])
+            if not isinstance(notes_raw, list) or not notes_raw:
+                continue
+            for n in notes_raw:
+                if not isinstance(n, dict):
+                    continue
+                pitch = _parse_pitch(n.get("pitch") or n.get("note"))
+                start = n.get("start_beat") or n.get("beat")
+                dur = _parse_duration(
+                    n.get("duration_beats") or n.get("duration")
+                )
+                if pitch is None or start is None:
+                    continue
+                if dur is None:
+                    dur = 1.0
+                vel = n.get("velocity", 80)
+                result.setdefault(name, []).append({
+                    "pitch": pitch,
+                    "start_beat": float(start),
+                    "duration_beats": dur,
+                    "velocity": min(127, max(1, int(vel))),
+                })
+
+    # Format B: edits array
+    if not result and "edits" in data and isinstance(data["edits"], list):
+        for edit in data["edits"]:
+            if not isinstance(edit, dict):
+                continue
+            if edit.get("action", "add") not in ("add", "modify"):
+                continue
+            pitch = _parse_pitch(edit.get("pitch"))
+            start = edit.get("start_beat")
+            dur = _parse_duration(
+                edit.get("duration_beats") or edit.get("duration")
+            )
+            if pitch is None or start is None or dur is None:
+                continue
+            track_name = edit.get("track", "melody")
+            vel = edit.get("velocity", 80)
+            result.setdefault(track_name, []).append({
+                "pitch": pitch,
+                "start_beat": float(start),
+                "duration_beats": dur,
+                "velocity": min(127, max(1, int(vel))),
+            })
+
+    return result if result else None
+
+
+def _match_instrument(
+    track_name: str,
+    inst_list: list[dict],
+    notes: list[dict],
+) -> tuple[str, dict | None]:
+    """Match a composer track to an instrumentalist assignment."""
+    tn = track_name.lower().replace("_", " ")
+    for inst in inst_list:
+        iname = inst["instrument"].lower()
+        irole = inst["role"].lower()
+        if tn in iname or iname in tn or tn in irole or irole in tn:
+            return inst["instrument"], inst
+    if inst_list:
+        avg_pitch = sum(n["pitch"] for n in notes) / len(notes) if notes else 60
+        if "bass" in tn or avg_pitch < 48:
+            for inst in inst_list:
+                if "bass" in inst["role"].lower():
+                    return inst["instrument"], inst
+        if "melody" in tn or "lead" in tn:
+            for inst in inst_list:
+                if "lead" in inst["role"].lower():
+                    return inst["instrument"], inst
+    return track_name, None
+
+
+def _get_section_lyrics(
+    section_name: str, start_beat: float, end_beat: float,
+    all_lyrics: list[dict],
+) -> list[dict] | None:
+    """Extract lyrics that belong to a specific section."""
+    result = []
+    sn = section_name.lower()
+    for lyric_block in all_lyrics:
+        block_section = lyric_block.get("section_name", "").lower()
+        lines = lyric_block.get("lines", [])
+        if not isinstance(lines, list):
+            continue
+        if sn in block_section or block_section in sn:
+            for line in lines:
+                if isinstance(line, dict) and "text" in line:
+                    result.append({
+                        "text": line["text"],
+                        "beat": float(line.get("start_beat", start_beat)),
+                    })
+    return result if result else None
+
+
 class MusicGenerationPipeline:
     """
     Initializes all agents and the SelectorGroupChat team,
@@ -280,19 +392,21 @@ class MusicGenerationPipeline:
 
     @staticmethod
     def _extract_score(messages: list[dict]) -> Score | None:
-        """Reconstruct a Score from agent conversation messages.
+        """Extract a Score from agent messages.
 
-        Parses orchestrator blueprint (metadata), composer edits (notes),
-        and instrumentalist assignments (tracks/instruments) to build
-        a complete Score suitable for MIDI export.
+        Strategy: find the latest composer message that contains a complete
+        score (tracks with notes). Merge with orchestrator metadata and
+        instrumentalist assignments. Also extract lyrics.
         """
         from src.music.score import ScoreNote, ScoreSection, ScoreTrack
 
         title, key, scale_type = "Untitled", "C", "major"
         tempo, time_sig = 120, [4, 4]
         blueprint_sections: list[dict] = []
-        all_notes: dict[str, list[dict]] = {}
         track_instruments: dict[str, dict] = {}
+        lyrics: list[dict] = []
+        best_score_tracks: dict[str, list[dict]] | None = None
+        best_note_count = 0
 
         for msg in messages:
             text = msg.get("content", "")
@@ -312,64 +426,16 @@ class MusicGenerationPipeline:
 
             elif source == "composer":
                 for data in json_blocks:
-                    # Format 1: {"edits": [...]}
-                    edits = data.get("edits", [])
-                    if isinstance(edits, list):
-                        for edit in edits:
-                            if not isinstance(edit, dict):
-                                continue
-                            if edit.get("action", "add") not in ("add", "modify"):
-                                continue
-                            pitch = _parse_pitch(edit.get("pitch"))
-                            start = edit.get("start_beat")
-                            dur = _parse_duration(edit.get("duration_beats"))
-                            if dur is None:
-                                dur = _parse_duration(edit.get("duration"))
-                            if pitch is None or start is None or dur is None:
-                                continue
-                            track_name = edit.get("track", "melody")
-                            vel = edit.get("velocity", 80)
-                            all_notes.setdefault(track_name, []).append({
-                                "pitch": pitch,
-                                "start_beat": float(start),
-                                "duration_beats": dur,
-                                "velocity": min(127, max(1, int(vel))),
-                            })
-
-                    # Format 2: nested {"sections": {"Intro": {"melody": [...]}}}
-                    if "sections" in data and isinstance(data["sections"], dict):
-                        beat_cursor = 0.0
-                        for sec_name, sec_data in data["sections"].items():
-                            if not isinstance(sec_data, dict):
-                                continue
-                            for track_key in ("melody", "chords", "bass",
-                                              "harmony", "accompaniment"):
-                                notes_list = sec_data.get(track_key, [])
-                                if not isinstance(notes_list, list):
-                                    continue
-                                for note_obj in notes_list:
-                                    if not isinstance(note_obj, dict):
-                                        continue
-                                    pitch = _parse_pitch(
-                                        note_obj.get("pitch") or note_obj.get("note")
-                                    )
-                                    beat = note_obj.get("beat") or note_obj.get("start_beat")
-                                    dur = _parse_duration(
-                                        note_obj.get("duration_beats")
-                                        or note_obj.get("duration")
-                                    )
-                                    if pitch is None or beat is None:
-                                        continue
-                                    if dur is None:
-                                        dur = 1.0
-                                    abs_beat = float(beat) + beat_cursor
-                                    vel = note_obj.get("velocity", 80)
-                                    all_notes.setdefault(track_key, []).append({
-                                        "pitch": pitch,
-                                        "start_beat": abs_beat,
-                                        "duration_beats": dur,
-                                        "velocity": min(127, max(1, int(vel))),
-                                    })
+                    candidate = _extract_tracks_from_json(data)
+                    if candidate:
+                        count = sum(len(ns) for ns in candidate.values())
+                        logger.info(
+                            f"[extract] composer candidate: "
+                            f"{len(candidate)} tracks, {count} notes"
+                        )
+                        if count > best_note_count:
+                            best_score_tracks = candidate
+                            best_note_count = count
 
             elif source == "instrumentalist":
                 for data in json_blocks:
@@ -378,6 +444,10 @@ class MusicGenerationPipeline:
                             inst_name = trk.get("instrument", "Piano")
                             raw_prog = int(trk.get("program_number", 0))
                             program = _map_instrument_program(inst_name, raw_prog)
+                            logger.info(
+                                f"[extract] instrument: {inst_name}, "
+                                f"raw_prog={raw_prog}, mapped={program}"
+                            )
                             track_instruments[inst_name] = {
                                 "instrument": inst_name,
                                 "role": trk.get("role", "accompaniment"),
@@ -385,9 +455,21 @@ class MusicGenerationPipeline:
                                 "program": program,
                             }
 
-        if not all_notes:
-            logger.warning("No note data found in any composer message")
+            elif source == "lyricist":
+                for data in json_blocks:
+                    if "lyrics" in data and isinstance(data["lyrics"], list):
+                        lyrics.extend(data["lyrics"])
+                    elif "lines" in data and isinstance(data["lines"], list):
+                        lyrics.append(data)
+
+        if not best_score_tracks:
+            logger.warning("No complete score found in any composer message")
             return None
+
+        logger.info(
+            f"[extract] Best score: {len(best_score_tracks)} tracks, "
+            f"{best_note_count} notes, {len(lyrics)} lyric sections"
+        )
 
         beats_per_bar = time_sig[0] if time_sig else 4
         sections: list[ScoreSection] = []
@@ -397,12 +479,16 @@ class MusicGenerationPipeline:
                 bars = int(sd.get("bars", 4))
                 sections.append(ScoreSection(
                     name=sd["name"], start_beat=beat_offset, bars=bars,
+                    lyrics=_get_section_lyrics(
+                        sd["name"], beat_offset,
+                        beat_offset + bars * beats_per_bar, lyrics,
+                    ),
                 ))
                 beat_offset += bars * beats_per_bar
         else:
             max_beat = max(
                 max(n["start_beat"] + n["duration_beats"] for n in ns)
-                for ns in all_notes.values()
+                for ns in best_score_tracks.values()
             )
             sections.append(ScoreSection(
                 name="main", start_beat=0.0,
@@ -411,23 +497,21 @@ class MusicGenerationPipeline:
 
         tracks: list[ScoreTrack] = []
         inst_list = list(track_instruments.values())
-        for idx, (track_name, notes) in enumerate(all_notes.items()):
-            matched = None
-            tn_lower = track_name.lower().replace("_", " ")
-            for inst in inst_list:
-                if (tn_lower in inst["instrument"].lower()
-                        or inst["instrument"].lower() in tn_lower
-                        or inst["role"].lower() in tn_lower):
-                    matched = inst
-                    break
-            if matched is None and idx < len(inst_list):
-                matched = inst_list[idx]
+        used_channels: set[int] = set()
 
-            raw_program = matched["program"] if matched else 0
-            program = _map_instrument_program(
-                matched["instrument"] if matched else track_name,
-                raw_program,
+        for idx, (track_name, notes) in enumerate(best_score_tracks.items()):
+            instrument_name, matched = _match_instrument(
+                track_name, inst_list, notes,
             )
+            program = _map_instrument_program(
+                instrument_name, matched.get("program", 0) if matched else 0,
+            )
+            channel = matched.get("channel", idx) if matched else idx
+            while channel in used_channels and channel < 15:
+                channel += 1
+            if channel == 9:
+                channel = 10
+            used_channels.add(channel)
 
             score_notes = sorted(
                 [ScoreNote(**n) for n in notes],
@@ -435,16 +519,20 @@ class MusicGenerationPipeline:
             )
             tracks.append(ScoreTrack(
                 name=track_name,
-                instrument=matched["instrument"] if matched else track_name,
-                role=matched["role"] if matched else "melody",
-                channel=matched["channel"] if matched else idx,
+                instrument=instrument_name,
+                role=matched.get("role", "melody") if matched else "melody",
+                channel=channel,
                 program=program,
                 notes=score_notes,
             ))
+            logger.info(
+                f"[extract] Track '{track_name}': instrument={instrument_name}, "
+                f"program={program}, ch={channel}, notes={len(score_notes)}"
+            )
 
         total_notes = sum(len(t.notes) for t in tracks)
         logger.info(
-            f"Score reconstructed: '{title}', {len(tracks)} tracks, "
+            f"Score built: '{title}', {len(tracks)} tracks, "
             f"{total_notes} notes, {len(sections)} sections"
         )
         return Score(
