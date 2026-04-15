@@ -39,6 +39,16 @@ class ScoreTrack(BaseModel):
     vst_preset: str | None = None
 
 
+_MIDI_NOTE_NAMES = [
+    "C", "C#", "D", "D#", "E", "F",
+    "F#", "G", "G#", "A", "A#", "B",
+]
+
+
+def _pitch_name(midi: int) -> str:
+    return f"{_MIDI_NOTE_NAMES[midi % 12]}{midi // 12 - 1}"
+
+
 class Score(BaseModel):
     title: str = "Untitled"
     key: str = "C"
@@ -48,14 +58,6 @@ class Score(BaseModel):
     sections: list[ScoreSection] = Field(default_factory=list)
     tracks: list[ScoreTrack] = Field(default_factory=list)
     version: int = 1
-
-    _MIDI_NOTE_NAMES = [
-        "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
-    ]
-
-    @classmethod
-    def _pitch_name(cls, midi: int) -> str:
-        return f"{cls._MIDI_NOTE_NAMES[midi % 12]}{midi // 12 - 1}"
 
     def to_summary(self) -> str:
         ts = self.time_signature
@@ -112,10 +114,10 @@ class Score(BaseModel):
                     continue
                 pitches = [n.pitch for n in notes_in]
                 vels = [n.velocity for n in notes_in]
-                lo = self._pitch_name(min(pitches))
-                hi = self._pitch_name(max(pitches))
+                lo = _pitch_name(min(pitches))
+                hi = _pitch_name(max(pitches))
                 first_few = " ".join(
-                    self._pitch_name(n.pitch)
+                    _pitch_name(n.pitch)
                     for n in notes_in[:6]
                 )
                 ellip = "..." if len(notes_in) > 6 else ""
