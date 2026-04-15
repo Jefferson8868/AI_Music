@@ -25,8 +25,9 @@ class InstrumentalistAgent(BaseChatAgent):
         return [TextMessage]
 
     async def on_messages(self, messages: Sequence[BaseChatMessage], cancellation_token: CancellationToken) -> Response:
-        context = "\n\n".join(m.to_text() for m in messages[-3:])
-        logger.info(f"[Instrumentalist] called with {len(messages)} messages, context={len(context)} chars")
+        recent = messages[-6:] if len(messages) > 6 else messages
+        context = "\n\n".join(m.to_text() for m in recent)
+        logger.info(f"[Instrumentalist] called with {len(messages)} messages, using last {len(recent)}, context={len(context)} chars")
 
         from autogen_core.models import SystemMessage, UserMessage
         llm_messages = [

@@ -26,14 +26,15 @@ class ComposerAgent(BaseChatAgent):
         return [TextMessage]
 
     async def on_messages(self, messages: Sequence[BaseChatMessage], cancellation_token: CancellationToken) -> Response:
-        context = "\n\n".join(m.to_text() for m in messages[-3:])
-        logger.info(f"[Composer] called with {len(messages)} messages, context={len(context)} chars")
+        recent = messages[-8:] if len(messages) > 8 else messages
+        context = "\n\n".join(m.to_text() for m in recent)
+        logger.info(f"[Composer] called with {len(messages)} messages, using last {len(recent)}, context={len(context)} chars")
 
         from autogen_core.models import SystemMessage, UserMessage
         llm_messages = [
             SystemMessage(content=COMPOSER_SYSTEM),
             UserMessage(
-                content=f"Based on the current conversation, perform your composing task:\n\n{context}",
+                content=f"Here is the conversation so far. Write concrete notes as JSON edits:\n\n{context}",
                 source=self.name,
             ),
         ]

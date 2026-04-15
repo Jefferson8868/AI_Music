@@ -27,7 +27,8 @@ class CriticAgent(BaseChatAgent):
         return [TextMessage]
 
     async def on_messages(self, messages: Sequence[BaseChatMessage], cancellation_token: CancellationToken) -> Response:
-        context = "\n\n".join(m.to_text() for m in messages[-5:])
+        recent = messages[-8:] if len(messages) > 8 else messages
+        context = "\n\n".join(m.to_text() for m in recent)
         logger.info(f"[Critic] called with {len(messages)} messages, context={len(context)} chars")
 
         from autogen_core.models import SystemMessage, UserMessage

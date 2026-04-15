@@ -8,3 +8,4 @@ models/*.mag
 resources/
 reaimgui/
 autogen/
+*.mid
