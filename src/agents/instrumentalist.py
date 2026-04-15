@@ -45,10 +45,6 @@ class InstrumentalistAgent(BaseChatAgent):
         raw = result.content if isinstance(result.content, str) else str(result.content)
         logger.info(f"[Instrumentalist] LLM responded in {time.time()-t0:.1f}s, {len(raw)} chars")
 
-        if "FINALIZED" not in raw:
-            logger.info("[Instrumentalist] appending FINALIZED to complete pipeline")
-            raw += "\n\nFINALIZED"
-
         return Response(chat_message=TextMessage(content=f"[Instrumentalist] {raw}", source=self.name))
 
     async def on_reset(self, cancellation_token: CancellationToken) -> None:

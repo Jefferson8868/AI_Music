@@ -49,21 +49,87 @@ class Score(BaseModel):
     tracks: list[ScoreTrack] = Field(default_factory=list)
     version: int = 1
 
+    _MIDI_NOTE_NAMES = [
+        "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
+    ]
+
+    @classmethod
+    def _pitch_name(cls, midi: int) -> str:
+        return f"{cls._MIDI_NOTE_NAMES[midi % 12]}{midi // 12 - 1}"
+
     def to_summary(self) -> str:
+        ts = self.time_signature
         lines = [
-            f"# {self.title} | {self.key} {self.scale_type} | "
-            f"{self.tempo}bpm | {self.time_signature[0]}/{self.time_signature[1]}"
+            f"# {self.title} | {self.key} {self.scale_type}"
+            f" | {self.tempo}bpm | {ts[0]}/{ts[1]}"
         ]
         for sec in self.sections:
-            chords_str = " → ".join(
-                f"{c.get('root', '?')}{c.get('quality', '')}" for c in sec.chords
+            chords_str = ", ".join(
+                f"{c.get('root', '?')}{c.get('quality', '')}"
+                for c in sec.chords
             )
-            lines.append(f"## {sec.name} ({sec.bars} bars): {chords_str}")
+            lines.append(
+                f"## {sec.name} ({sec.bars} bars): {chords_str}"
+            )
         for trk in self.tracks:
             lines.append(
-                f"Track [{trk.name}] ({trk.role}): {len(trk.notes)} notes, ch={trk.channel}"
+                f"Track [{trk.name}] ({trk.role}): "
+                f"{len(trk.notes)} notes, ch={trk.channel}"
             )
         return "\n".join(lines)
+
+    def to_llm_description(self) -> str:
+        """Section-by-section text summary readable by LLMs."""
+        bpb = self.time_signature[0] if self.time_signature else 4
+        ts = self.time_signature
+        total = sum(len(t.notes) for t in self.tracks)
+        parts: list[str] = [
+            f"SCORE: {self.title} | key={self.key} "
+            f"{self.scale_type} | tempo={self.tempo} | "
+            f"time={ts[0]}/{ts[1]} | "
+            f"tracks={len(self.tracks)} | total_notes={total}",
+        ]
+
+        for sec in self.sections:
+            sec_end = sec.start_beat + sec.bars * bpb
+            bar_start = int(sec.start_beat // bpb) + 1
+            bar_end = int(sec_end // bpb)
+            sec_header = (
+                f"\n[{sec.name.upper()}] "
+                f"bars {bar_start}-{bar_end}, "
+                f"beats {sec.start_beat:.0f}-{sec_end:.0f}:"
+            )
+            track_descs: list[str] = []
+            for trk in self.tracks:
+                notes_in = [
+                    n for n in trk.notes
+                    if sec.start_beat <= n.start_beat < sec_end
+                ]
+                if not notes_in:
+                    track_descs.append(
+                        f"  {trk.name} ({trk.instrument}): EMPTY"
+                    )
+                    continue
+                pitches = [n.pitch for n in notes_in]
+                vels = [n.velocity for n in notes_in]
+                lo = self._pitch_name(min(pitches))
+                hi = self._pitch_name(max(pitches))
+                first_few = " ".join(
+                    self._pitch_name(n.pitch)
+                    for n in notes_in[:6]
+                )
+                ellip = "..." if len(notes_in) > 6 else ""
+                track_descs.append(
+                    f"  {trk.name} ({trk.instrument}): "
+                    f"{len(notes_in)} notes, "
+                    f"pitch {lo}-{hi}, "
+                    f"vel {min(vels)}-{max(vels)}, "
+                    f"starts: {first_few}{ellip}"
+                )
+            parts.append(sec_header)
+            parts.extend(track_descs)
+
+        return "\n".join(parts)
 
     def get_section_notes(self, section_name: str, track_name: str) -> list[ScoreNote]:
         sec = next((s for s in self.sections if s.name == section_name), None)
@@ -148,6 +214,7 @@ class CompositionBlueprint(BaseModel):
     primer_notes: list[int] = Field(default_factory=lambda: [60, 64, 67])
     primer_temperature: float = 1.0
     global_notes: str = ""
+
 
 class CriticIssue(BaseModel):
     aspect: str
