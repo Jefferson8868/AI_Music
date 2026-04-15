@@ -361,12 +361,16 @@ class MusicGenerationPipeline:
 
         except Exception as e:
             # #region agent log
-            _dlog("pipeline.py:run:error", "Pipeline exception", {"error": str(e), "type": type(e).__name__, "traceback": _tb.format_exc(), "msg_count": msg_count, "hypothesisId": "H-A,H-B,H-C,H-D"})
+            full_tb = _tb.format_exc()
+            try:
+                _dlog("pipeline.py:run:error", "Pipeline exception", {"error": str(e), "type": type(e).__name__, "traceback": full_tb, "msg_count": msg_count})
+            except Exception:
+                pass
             # #endregion
-            logger.error(f"Pipeline error: {e}")
+            logger.error(f"Pipeline error: {e}\n{full_tb}")
             if self._on_progress:
                 await self._on_progress("error", str(e), 0.0)
-            return PipelineResult(messages=[], total_messages=0, error=str(e))
+            return PipelineResult(messages=[], total_messages=0, error=f"{str(e)}\n\nTRACEBACK:\n{full_tb}")
 
     async def run_stream(self, request: MusicRequest):
         """Stream messages from the pipeline as they are generated."""
