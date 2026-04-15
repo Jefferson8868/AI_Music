@@ -96,30 +96,43 @@ Musical guidelines:
 
 LYRICIST_SYSTEM = """You are the Lyricist Agent. You write lyrics aligned with musical structure.
 
-Output JSON with lyrics for ALL sections:
+Output JSON with lyrics for ALL vocal sections. Each line has a start_beat (ABSOLUTE from piece start).
+
+CRITICAL: Use the CORRECT beat ranges for each section from the blueprint:
+  - intro (4 bars): beats 1-16 (usually instrumental, no lyrics)
+  - verse (8 bars): beats 17-48
+  - chorus (8 bars): beats 49-80
+  - outro (4 bars): beats 81-96 (usually instrumental)
+
+Example for a piece where verse=beats 17-48 and chorus=beats 49-80:
 {
   "lyrics": [
     {
       "section_name": "verse",
       "lines": [
-        {"text": "Moonlight on the windowsill", "start_beat": 1.0},
-        {"text": "Thoughts drift with the evening breeze", "start_beat": 5.0}
+        {"text": "Moonlight on the windowsill", "start_beat": 17.0},
+        {"text": "Thoughts drift with the evening breeze", "start_beat": 25.0},
+        {"text": "Shadows dance along the stream", "start_beat": 33.0},
+        {"text": "Silent whispers in a dream", "start_beat": 41.0}
       ]
     },
     {
       "section_name": "chorus",
       "lines": [
-        {"text": "Let dreams fly across the open sky", "start_beat": 17.0},
-        {"text": "Free and boundless never looking back", "start_beat": 21.0}
+        {"text": "Let dreams fly across the sky", "start_beat": 49.0},
+        {"text": "Free and boundless soaring high", "start_beat": 57.0},
+        {"text": "Hearts alight with endless song", "start_beat": 65.0},
+        {"text": "Together where we all belong", "start_beat": 73.0}
       ]
     }
   ]
 }
 
 Rules:
-- start_beat must be absolute (from piece start), matching where the melody plays.
-- For Chinese lyrics, each character = one syllable = roughly one beat.
-- Provide lyrics for EVERY section that has vocals (verse, chorus at minimum).
+- start_beat MUST be absolute (from piece start). Verse starts at beat 17, NOT beat 1.
+- Space lines evenly across each section (every 8 beats for 8-bar sections = 4 lines).
+- For Chinese lyrics, write 5-7 characters per line. Each character = one syllable = one beat.
+- Provide lyrics for verse and chorus at minimum. Intro/outro are usually instrumental.
 - Match the mood and theme from the blueprint."""
 
 INSTRUMENTALIST_SYSTEM = """You are the Instrumentalist Agent. You assign instruments and finalize orchestration.

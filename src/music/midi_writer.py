@@ -180,17 +180,27 @@ def score_to_midi(score, ticks_per_beat: int = 480) -> mido.MidiFile:
         "track_name", name=score.title, time=0,
     ))
 
-    # Add lyrics as meta events on the tempo track
+    # Add lyrics as meta events on the tempo track.
+    # Split multi-character lines so each character aligns to one beat.
     lyric_events: list[tuple[int, mido.MetaMessage]] = []
     for sec in score.sections:
         if sec.lyrics:
             for lyric in sec.lyrics:
                 if isinstance(lyric, dict) and "text" in lyric:
+                    text = lyric["text"].strip()
                     beat = float(lyric.get("beat", sec.start_beat))
-                    tick = _beats_to_ticks(beat, ticks_per_beat)
-                    lyric_events.append((tick, mido.MetaMessage(
-                        "lyrics", text=lyric["text"], time=0,
-                    )))
+                    chars = [ch for ch in text if not ch.isspace()]
+                    if len(chars) > 1 and any(ord(c) > 127 for c in chars):
+                        for i, ch in enumerate(chars):
+                            tick = _beats_to_ticks(beat + i, ticks_per_beat)
+                            lyric_events.append((tick, mido.MetaMessage(
+                                "lyrics", text=ch, time=0,
+                            )))
+                    else:
+                        tick = _beats_to_ticks(beat, ticks_per_beat)
+                        lyric_events.append((tick, mido.MetaMessage(
+                            "lyrics", text=text, time=0,
+                        )))
     if lyric_events:
         lyric_events.sort(key=lambda x: x[0])
         prev = 0
