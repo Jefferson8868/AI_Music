@@ -36,7 +36,7 @@ class Settings(BaseSettings):
     # Agent pipeline
     max_refinement_rounds: int = 5
     max_inspiration_resets: int = 3
-    max_group_chat_messages: int = 50
+    max_group_chat_messages: int = 15
     critic_pass_threshold: float = 0.8
     critic_regen_threshold: float = 0.5
     agent_timeout: float = 120.0

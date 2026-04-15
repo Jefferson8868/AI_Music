@@ -59,16 +59,13 @@ Output format:
 ABSOLUTE REQUIREMENTS:
 1. pitch = MIDI number (integer). Middle C = 60. Scale reference:
    C pentatonic: C4=60, D4=62, E4=64, G4=67, A4=69, C5=72, D5=74, E5=76
-   Chromatic: C4=60, C#4=61, D4=62, Eb4=63, E4=64, F4=65, F#4=66, G4=67
 2. start_beat = absolute position from piece start. Beat 1.0 = first beat.
-   A 4-bar phrase in 4/4 spans beats 1.0 to 16.0.
-   Section offsets: if intro=4 bars, verse starts at beat 17.0.
+   Section offsets: intro(4 bars)=beats 1-16, verse(8 bars)=beats 17-48, chorus(8 bars)=beats 49-80, outro(4 bars)=beats 81-96.
 3. duration_beats: whole=4.0, half=2.0, quarter=1.0, eighth=0.5
-4. MINIMUM NOTES: 8-12 notes per bar of melody. A 4-section piece (24 bars) needs 100+ melody notes.
-5. Include at least 2 tracks: melody + accompaniment. 3-4 tracks preferred.
-6. Each track MUST have at least 30 notes for a full piece.
-7. Cover ALL sections (intro through outro). Do not leave sections empty.
-8. When revising after critic feedback: output the COMPLETE updated score, not just changes.
+4. MINIMUM: 2-4 notes per bar of melody. A 24-bar piece needs 50-80 melody notes.
+5. Include 2-3 tracks: melody + chords (+ optional bass).
+6. Cover ALL sections (intro through outro). Do not skip any.
+7. When revising: output the COMPLETE updated score, not just changes.
 
 Musical guidelines:
 - Melody: stepwise motion with occasional leaps. Resolve leaps by stepping back.
@@ -84,15 +81,15 @@ Output JSON with lyrics for ALL sections:
     {
       "section_name": "verse",
       "lines": [
-        {"text": "月光洒在旧窗台", "start_beat": 1.0},
-        {"text": "心事随风飘向海", "start_beat": 5.0}
+        {"text": "Moonlight on the windowsill", "start_beat": 1.0},
+        {"text": "Thoughts drift with the evening breeze", "start_beat": 5.0}
       ]
     },
     {
       "section_name": "chorus",
       "lines": [
-        {"text": "让梦飞过山和海", "start_beat": 17.0},
-        {"text": "自由自在不回来", "start_beat": 21.0}
+        {"text": "Let dreams fly across the open sky", "start_beat": 17.0},
+        {"text": "Free and boundless never looking back", "start_beat": 21.0}
       ]
     }
   ]
@@ -118,7 +115,7 @@ Output JSON:
   ]
 }
 
-CRITICAL — Correct General MIDI program numbers (you MUST use these exact numbers):
+CRITICAL - Correct General MIDI program numbers (you MUST use these exact numbers):
   Piano: 0          Bright Piano: 1      Harpsichord: 6
   Celesta: 8        Glockenspiel: 9      Music Box: 10
   Vibraphone: 11    Marimba: 12          Xylophone: 13
@@ -132,10 +129,10 @@ CRITICAL — Correct General MIDI program numbers (you MUST use these exact numb
   Pad Warm: 89      Pad Choir: 91
 
 IMPORTANT:
-- Guzheng/古筝 MUST use program_number=107 (Koto). NEVER use 0 or 1.
-- Erhu/二胡 MUST use program_number=110 (Fiddle). NEVER use 0 or 1.
-- Pipa/琵琶 MUST use program_number=106 (Shamisen).
-- Dizi/笛子 MUST use program_number=77 (Shakuhachi).
+- Guzheng MUST use program_number=107 (Koto). NEVER use 0 or 1.
+- Erhu MUST use program_number=110 (Fiddle). NEVER use 0 or 1.
+- Pipa MUST use program_number=106 (Shamisen).
+- Dizi MUST use program_number=77 (Shakuhachi).
 - Each instrument MUST have a unique midi_channel (0-15, skip 9 for drums)."""
 
 CRITIC_SYSTEM = """You are the Critic Agent. Review the musical score for quality.
@@ -161,24 +158,12 @@ Evaluation:
 - Lyrics should exist if the blueprint requested them.
 - passes=true only when overall_score >= 0.8."""
 
-SELECTOR_PROMPT = """Select the next agent to speak. Follow this exact sequence:
+SELECTOR_PROMPT = """Select the next agent. Follow this sequence:
 
-1. orchestrator (creates blueprint)
-2. composer (writes FULL score with all notes — this is the most important step)
-3. synthesizer (tries Magenta draft — skip if unavailable)
-4. critic (reviews the score)
-5. composer (revises based on feedback — outputs COMPLETE updated score)
-6. lyricist (writes lyrics for all sections)
-7. critic (second review)
-8. composer (final revisions if needed)
-9. instrumentalist (assigns GM instruments)
-10. "FINALIZED"
+1. orchestrator -> 2. composer -> 3. critic -> 4. composer -> 5. lyricist -> 6. instrumentalist -> FINALIZED
 
-Rules:
-- Never select synthesizer if it previously failed.
-- Never select the same agent 3+ times in a row.
-- After instrumentalist responds, output "FINALIZED".
-- The composer MUST be selected at least twice to ensure enough notes.
+Skip synthesizer if it previously failed. After instrumentalist, output "FINALIZED".
+Never select the same agent 3 times in a row.
 
 Available agents: {participants}
 {history}"""
