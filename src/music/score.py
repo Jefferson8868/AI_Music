@@ -400,7 +400,7 @@ def format_metrics_for_critic(metrics: dict) -> str:
 class MainScore:
     """Lead sheet produced in Phase 2: melody + chords + rhythm guide + instrument plan."""
 
-    melody: list  # list of ScoreNote (or dicts with pitch/start_beat/duration_beats/velocity)
+    melody: "list[ScoreNote]"
     chord_progression: list = field(default_factory=list)     # [{bar, root, quality}]
     rhythm_guide: dict = field(default_factory=dict)           # {section_name: "4-6 notes/bar"}
     instrument_plan: dict = field(default_factory=dict)        # {instrument_name: role description}
