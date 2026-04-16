@@ -80,6 +80,7 @@ def build_composer_section_prompt(
     previous_summary: str,
     draft_description: str,
     critic_feedback: str,
+    instrument_knowledge: list[str] | None = None,
 ) -> str:
     """Build a focused prompt for composing ONE section."""
     inst_lines = "\n".join(
@@ -121,13 +122,23 @@ def build_composer_section_prompt(
         "C4=60, D4=62, E4=64, G4=67, A4=69, C5=72.",
         "- Include ALL tracks from the blueprint:",
         inst_lines,
-        "",
-        "Musical guidelines:",
-        "- Melody: stepwise motion with occasional leaps.",
-        "- Counter-melody: harmonize a third/fifth above/below.",
-        "- Chords: chord tones on beats 1 and 3.",
-        "- Bass: root on beat 1, fifth on beat 3.",
     ]
+
+    if instrument_knowledge:
+        parts.append("")
+        parts.append(
+            "INSTRUMENT KNOWLEDGE (write idiomatic parts for each):"
+        )
+        for knowledge_block in instrument_knowledge:
+            parts.append(knowledge_block)
+
+    parts.append("")
+    parts.append(
+        "IMPORTANT: Use each instrument's idiomatic intervals, "
+        "techniques, and phrase styles described above. "
+        "Do NOT write bare ascending/descending scales. "
+        "Each instrument should have its own character."
+    )
 
     if previous_summary:
         parts.append("")
@@ -231,9 +242,10 @@ Output JSON:
 Correct GM program numbers:
   Piano: 0, Dulcimer/Yangqin: 15, Acoustic Guitar: 24
   Violin: 40, Viola: 41, Cello: 42, Contrabass: 43
-  Strings: 48, Flute: 73, Pan Flute/Xiao: 75
-  Shakuhachi/Dizi: 77, Pad Warm: 89
-  Shamisen/Pipa: 106, Koto/Guzheng: 107, Fiddle/Erhu: 110
+  Strings: 48, Trumpet: 56, Clarinet: 71, Flute: 73
+  Pan Flute/Xiao: 75, Shakuhachi/Dizi: 77, Harp: 46
+  Pad Warm: 89, Shamisen/Pipa: 106, Koto/Guzheng: 107
+  Fiddle/Erhu: 110
 
 IMPORTANT:
 - Guzheng MUST use program_number=107.
@@ -243,13 +255,36 @@ IMPORTANT:
 - Each instrument MUST have a unique midi_channel (0-15, skip 9).
 - Spread pan for stereo width: lead=0, others -40 to +40.
 
-Articulation types for Eastern instruments:
+Articulation types (MIDI implementation):
 - "vibrato": periodic pitch oscillation (CC1 modulation).
 - "pitch_bend": slides for erhu/guzheng (MIDI pitch bend).
 - "glissando": rapid pitch sweep between notes.
 - "tremolo": rapid note repetition (CC11 expression).
 - "staccato": shortened note duration (50%).
-Use articulations where musically appropriate."""
+
+Apply articulations IDIOMATICALLY per instrument — see technique \
+guidance below. Every instrument should have at least 1-2 \
+articulation entries in the sections where it plays."""
+
+
+def build_instrumentalist_prompt(
+    instrument_techniques: list[str] | None = None,
+) -> str:
+    """Build Instrumentalist context with instrument-specific techniques."""
+    parts = [INSTRUMENTALIST_SYSTEM]
+    if instrument_techniques:
+        parts.append("")
+        parts.append("INSTRUMENT TECHNIQUE REFERENCE:")
+        for tech in instrument_techniques:
+            parts.append(f"  {tech}")
+        parts.append("")
+        parts.append(
+            "Use each instrument's specific techniques listed above "
+            "when assigning articulations. Map techniques to "
+            "articulation types: vibrato, pitch_bend, glissando, "
+            "tremolo, staccato."
+        )
+    return "\n".join(parts)
 
 
 CRITIC_SYSTEM = """You are the Critic Agent. Evaluate musical quality \
@@ -269,13 +304,14 @@ Output JSON:
     "rhythmic_interest": 0.8,
     "arrangement": 0.7,
     "section_contrast": 0.5,
+    "instrument_idiom": 0.5,
     "lyrics_quality": 0.6,
     "lyrics_alignment": 0.5
   },
   "issues": [
-    {"aspect": "melodic_contour", "severity": "major",
-     "description": "Melody in verse is a flat repeated pitch",
-     "suggestion": "Add stepwise motion and occasional leaps"}
+    {"aspect": "instrument_idiom", "severity": "major",
+     "description": "Guzheng plays bare ascending scale",
+     "suggestion": "Use pentatonic intervals with ornamental slides"}
   ],
   "revision_instructions": "Specific instructions for each agent."
 }
@@ -287,8 +323,37 @@ Focus on QUALITATIVE musical judgment:
 - Are transitions between sections smooth?
 - Do lyrics fit the mood and rhythm naturally?
 
+INSTRUMENT IDIOM CHECK (critical):
+- Does each instrument sound like itself?
+- Are instruments using their idiomatic techniques and intervals?
+- REJECT bare ascending/descending scales — real instruments \
+play with contour, ornaments, and varied rhythms.
+- REJECT instruments with only 1-2 notes per section \
+(unless it is intentional sparse texture like xiao).
+
 The system already checks quantitative thresholds (note counts, density). \
 Your job is musical taste and artistic quality.
 
 passes=true only when overall_score >= 0.75.
 revision_instructions must be SPECIFIC: tell each agent what to fix."""
+
+
+def build_critic_prompt(
+    instrument_criteria: list[str] | None = None,
+) -> str:
+    """Build Critic context with instrument-specific evaluation criteria."""
+    parts = [CRITIC_SYSTEM]
+    if instrument_criteria:
+        parts.append("")
+        parts.append(
+            "INSTRUMENT-SPECIFIC EVALUATION CRITERIA:"
+        )
+        for criterion in instrument_criteria:
+            parts.append(criterion)
+        parts.append("")
+        parts.append(
+            "Score instrument_idiom LOW if any instrument "
+            "violates its criteria above. Be specific in issues "
+            "about WHICH instrument needs improvement and HOW."
+        )
+    return "\n".join(parts)

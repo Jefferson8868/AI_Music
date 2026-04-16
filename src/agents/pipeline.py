@@ -32,6 +32,11 @@ from src.agents.critic import CriticAgent
 from src.agents.synthesizer import SynthesizerAgent
 from src.llm.client import create_llm_client
 from src.llm.prompts import build_composer_section_prompt
+from src.knowledge.instruments import (
+    format_for_composer,
+    format_for_instrumentalist,
+    format_for_critic,
+)
 from src.music.models import MusicRequest
 from src.music.score import (
     Score, ScoreNote, ScoreSection, ScoreTrack,
@@ -446,6 +451,50 @@ def _previous_section_summary(
 
 
 # ---------------------------------------------------------------------------
+# Instrument knowledge helpers
+# ---------------------------------------------------------------------------
+
+def _build_composer_knowledge(
+    instruments: list[dict],
+) -> list[str]:
+    """Look up instrument knowledge cards for all blueprint instruments."""
+    knowledge: list[str] = []
+    for inst in instruments:
+        name = inst.get("name", "")
+        role = inst.get("role", "accompaniment")
+        text = format_for_composer(name, role)
+        if text:
+            knowledge.append(text)
+    return knowledge
+
+
+def _build_instrumentalist_techniques(
+    instruments: list[dict],
+) -> list[str]:
+    """Look up technique guides for the Instrumentalist agent."""
+    techniques: list[str] = []
+    for inst in instruments:
+        name = inst.get("name", "")
+        text = format_for_instrumentalist(name)
+        if text:
+            techniques.append(text)
+    return techniques
+
+
+def _build_critic_criteria(
+    instruments: list[dict],
+) -> list[str]:
+    """Look up evaluation criteria for the Critic agent."""
+    criteria: list[str] = []
+    for inst in instruments:
+        name = inst.get("name", "")
+        text = format_for_critic(name)
+        if text:
+            criteria.append(text)
+    return criteria
+
+
+# ---------------------------------------------------------------------------
 # Score building from accumulated section tracks
 # ---------------------------------------------------------------------------
 
@@ -786,6 +835,9 @@ class MusicGenerationPipeline:
 
                 all_tracks = {}
                 completed = []
+                inst_knowledge = _build_composer_knowledge(
+                    blueprint_instruments,
+                )
                 for si, sec in enumerate(enriched_sections):
                     prev_summary = _previous_section_summary(
                         all_tracks, completed,
@@ -806,6 +858,7 @@ class MusicGenerationPipeline:
                         critic_feedback=(
                             critic_feedback if si == 0 else ""
                         ),
+                        instrument_knowledge=inst_knowledge,
                     )
 
                     comp_resp = await self._call_agent(
@@ -965,7 +1018,17 @@ class MusicGenerationPipeline:
                         base_progress + step * 2,
                     )
 
+                inst_techniques = _build_instrumentalist_techniques(
+                    blueprint_instruments,
+                )
                 inst_context = ""
+                if inst_techniques:
+                    inst_context += (
+                        "INSTRUMENT TECHNIQUE REFERENCE:\n"
+                    )
+                    for tech in inst_techniques:
+                        inst_context += f"  {tech}\n"
+                    inst_context += "\n"
                 if current_score:
                     inst_context += (
                         f"Score summary:\n"
@@ -982,7 +1045,9 @@ class MusicGenerationPipeline:
                     )
                 inst_context += (
                     "\nAssign instruments, MIDI channels, "
-                    "GM program numbers, and articulations."
+                    "GM program numbers, and articulations. "
+                    "Use each instrument's specific techniques "
+                    "when assigning articulations."
                 )
 
                 inst_resp = await self._call_agent(
@@ -1034,7 +1099,19 @@ class MusicGenerationPipeline:
                         base_progress + step * 3,
                     )
 
+                inst_criteria = _build_critic_criteria(
+                    blueprint_instruments,
+                )
                 critic_context = ""
+                if inst_criteria:
+                    critic_context += (
+                        "INSTRUMENT-SPECIFIC EVALUATION "
+                        "CRITERIA:\n"
+                    )
+                    for criterion in inst_criteria:
+                        critic_context += f"{criterion}\n"
+                    critic_context += "\n"
+
                 if current_score:
                     metrics = compute_score_metrics(
                         current_score, enriched_sections, lyrics,
@@ -1060,7 +1137,9 @@ class MusicGenerationPipeline:
                 critic_context += (
                     "Evaluate the music AND lyrics together. "
                     "Use the metrics above as facts. "
-                    "Focus on qualitative musical judgment."
+                    "Focus on qualitative musical judgment. "
+                    "Check instrument_idiom using the criteria "
+                    "above."
                 )
 
                 crit_resp = await self._call_agent(
