@@ -42,6 +42,16 @@ class Settings(BaseSettings):
     agent_timeout: float = 120.0
     quantization_grid: float = 0.25
 
+    # Nested loop settings
+    max_outer_loops: int = 3
+    max_inner_loops: int = 2
+    min_density_lead: int = 4         # notes/bar for lead role
+    min_density_counter: int = 2      # notes/bar for counter-melody
+    min_density_accomp: int = 2       # notes/bar for accompaniment
+    min_density_bass: int = 1         # notes/bar for bass
+    inner_critic_threshold: float = 0.75
+    ensemble_critic_threshold: float = 0.80
+
     model_config = {
         "env_prefix": "MG_",
         "env_file": Path(__file__).parent.parent / ".env",

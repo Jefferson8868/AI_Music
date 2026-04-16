@@ -357,3 +357,425 @@ def build_critic_prompt(
             "about WHICH instrument needs improvement and HOW."
         )
     return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Phase 2: Lead Sheet Creation
+# ---------------------------------------------------------------------------
+
+COMPOSER_LEAD_SHEET_SYSTEM = """You are the Lead Sheet Composer. \
+You create the song's core identity: a single-voice melody, \
+chord progression, rhythm density guide, and instrument distribution plan.
+
+This lead sheet is the FOUNDATION that all instrument arrangements \
+will be built against. It must be compelling on its own.
+
+Output ONLY valid JSON:
+{
+  "melody": [
+    {"pitch": 67, "start_beat": 1.0, "duration_beats": 1.0, "velocity": 80},
+    {"pitch": 69, "start_beat": 2.0, "duration_beats": 0.5, "velocity": 75}
+  ],
+  "chord_progression": [
+    {"bar": 1, "root": "C", "quality": "minor"},
+    {"bar": 2, "root": "F", "quality": "major"}
+  ],
+  "rhythm_guide": {
+    "intro": "sparse, 2-3 notes/bar, gentle entry",
+    "verse": "moderate, 4-6 notes/bar, flowing",
+    "chorus": "dense, 6-10 notes/bar, climactic"
+  },
+  "instrument_plan": {
+    "Guzheng": "lead melody in verse and chorus, arpeggiated fills in bridge",
+    "Erhu": "counter-melody in chorus, sustained notes in verse",
+    "Cello": "bass foundation throughout, pizzicato in verse, arco in chorus"
+  }
+}
+
+RULES:
+- melody: SINGLE voice. This is THE melody of the song.
+- All start_beat and duration_beats MUST be multiples of 0.25.
+- pitch = MIDI number. C4=60, D4=62, E4=64, G4=67, A4=69, C5=72.
+- Melody must cover ALL sections with appropriate density.
+- Chord progression: one chord per bar minimum.
+- rhythm_guide: per-section density targets for arrangers.
+- instrument_plan: describe WHERE and HOW each instrument participates.
+- Create a melody with contour: rises, falls, repeated motifs, climax.
+- Do NOT write bare ascending/descending scales."""
+
+
+def build_composer_lead_sheet_prompt(
+    enriched_sections: list[dict],
+    key: str,
+    scale_type: str,
+    instruments: list[dict],
+    draft_description: str,
+    critic_feedback: str,
+) -> str:
+    """Build prompt for Phase 2 lead-sheet creation."""
+    sec_lines = []
+    for sec in enriched_sections:
+        sec_lines.append(
+            f"  [{sec['name'].upper()}] bars {sec.get('bar_start', '?')}-"
+            f"{sec.get('bar_end', '?')}, "
+            f"beats {sec['start_beat']}-{sec['end_beat']}, "
+            f"{sec['bars']} bars, mood: {sec.get('mood', 'neutral')}"
+        )
+
+    inst_lines = []
+    for i in instruments:
+        inst_lines.append(f"  {i.get('name', '?')} ({i.get('role', 'accompaniment')})")
+
+    parts = [
+        f"Create a lead sheet for a song in {key} {scale_type}.",
+        "",
+        "SECTIONS:",
+        *sec_lines,
+        "",
+        "INSTRUMENTS to plan for:",
+        *inst_lines,
+        "",
+        "Write a melody that spans ALL sections, with chord progression "
+        "and rhythm guide. The melody should be singable and memorable.",
+    ]
+
+    if draft_description:
+        parts.append("")
+        parts.append("Magenta draft reference (use as inspiration):")
+        parts.append(draft_description[:800])
+
+    if critic_feedback:
+        parts.append("")
+        parts.append("Critic feedback to address:")
+        parts.append(critic_feedback)
+
+    return "\n".join(parts)
+
+
+STRUCTURAL_CRITIC_SYSTEM = """You are the Structural Critic. \
+You evaluate LEAD SHEETS only (melody + chord progression + rhythm guide).
+
+You will receive pre-computed metrics. RELY STRICTLY on these numbers.
+
+Output JSON:
+{
+  "overall_score": 0.7,
+  "passes": false,
+  "aspect_scores": {
+    "melodic_contour": 0.6,
+    "harmonic_quality": 0.7,
+    "rhythmic_interest": 0.8,
+    "section_contrast": 0.5,
+    "melody_density": 0.6,
+    "chord_progression": 0.7
+  },
+  "issues": [
+    {"aspect": "melodic_contour", "severity": "major",
+     "description": "Melody is flat with no climax in chorus",
+     "suggestion": "Add ascending motion building to beat 33 peak"}
+  ],
+  "revision_instructions": "Specific changes to the lead sheet."
+}
+
+Focus on:
+- Does the melody have a compelling contour (not flat or repetitive)?
+- Is there a clear climax (usually in chorus)?
+- Do chord changes support the melody and create tension/resolution?
+- Is the rhythm guide realistic (enough density for each section type)?
+- Is the instrument plan well-balanced (each instrument has a clear role)?
+- Are section transitions smooth (melody connects across boundaries)?
+
+passes=true only when overall_score >= 0.75.
+Be SPECIFIC about what to fix in revision_instructions."""
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: Inner Loop (Per-Instrument)
+# ---------------------------------------------------------------------------
+
+INNER_CRITIC_SYSTEM = """You are the Instrument Critic. \
+You evaluate a SINGLE instrument's part against the main score (lead sheet).
+
+You will receive pre-computed density metrics and gap reports. \
+RELY STRICTLY on these numbers. Do NOT count notes yourself.
+
+Output JSON:
+{
+  "overall_score": 0.7,
+  "passes": false,
+  "aspect_scores": {
+    "density": 0.6,
+    "melodic_fit": 0.7,
+    "idiomatic_playing": 0.8,
+    "register_usage": 0.7,
+    "continuity": 0.5
+  },
+  "issues": [
+    {"aspect": "density", "severity": "major",
+     "description": "Bars 5-8 have 0 notes, minimum is 4/bar for lead",
+     "suggestion": "Fill bars 5-8 with melody continuation"}
+  ],
+  "revision_instructions": "Specific changes for this instrument."
+}
+
+Evaluate:
+- DENSITY: Does this instrument meet the minimum notes/bar for its role? \
+Check the gap report carefully.
+- MELODIC FIT: Does it complement (not clash with) the main melody?
+- IDIOMATIC PLAYING: Does it sound natural for this instrument?
+- REGISTER USAGE: Is it using the instrument's sweet spot?
+- CONTINUITY: Are there abrupt gaps or disconnected phrases?
+- TRANSITIONS: Do section boundaries connect smoothly?
+
+CRITICAL: If the gap report shows density violations, you MUST set \
+passes=false regardless of other qualities. Sparse music is the #1 problem.
+
+passes=true only when overall_score >= 0.75 AND no critical gaps exist."""
+
+
+def build_inner_composer_prompt(
+    instrument_name: str,
+    instrument_role: str,
+    section_name: str,
+    start_beat: float,
+    end_beat: float,
+    bars: int,
+    mood: str,
+    key: str,
+    scale_type: str,
+    main_score_description: str,
+    arranged_instruments_context: str,
+    density_heatmap: str,
+    gap_report: str,
+    overlap_context: str,
+    instrument_knowledge: str,
+    critic_feedback: str,
+    distribution_guidance: str,
+) -> str:
+    """Build per-section, per-instrument composition prompt for the inner loop."""
+    rule = _SECTION_RULES.get(
+        section_name.lower(),
+        f"Write notes appropriate for a '{mood}' section.",
+    )
+
+    parts = [
+        f"You are composing the [{section_name.upper()}] section "
+        f"for {instrument_name} ({instrument_role}).",
+        f"Beats {start_beat} to {end_beat} ({bars} bars). Mood: {mood}.",
+        f"Key: {key} {scale_type}.",
+        "",
+        f"Section rule: {rule}",
+    ]
+
+    if distribution_guidance:
+        parts.append("")
+        parts.append(f"YOUR ROLE: {distribution_guidance}")
+
+    parts.extend([
+        "",
+        "Output JSON for THIS INSTRUMENT, THIS SECTION ONLY:",
+        "{",
+        f'  "section": "{section_name}",',
+        '  "tracks": [',
+        '    {',
+        f'      "name": "{instrument_name.lower()}",',
+        f'      "instrument": "{instrument_name}",',
+        '      "notes": [',
+        f'        {{"pitch": 67, "start_beat": {start_beat}, '
+        f'"duration_beats": 1.0, "velocity": 75}}',
+        '      ]',
+        '    }',
+        '  ]',
+        "}",
+        "",
+        "RULES:",
+        f"- All start_beat MUST be >= {start_beat} and < {end_beat}.",
+        "- All start_beat and duration_beats MUST be multiples of 0.25.",
+        "- pitch = MIDI number (integer).",
+        f"- Output ONLY the track for {instrument_name}.",
+    ])
+
+    if main_score_description:
+        parts.append("")
+        parts.append("MAIN SCORE (the song's lead sheet \u2014 your reference):")
+        parts.append(main_score_description)
+
+    if arranged_instruments_context:
+        parts.append("")
+        parts.append(
+            "ALREADY ARRANGED INSTRUMENTS "
+            "(compose to complement these, avoid clashing):"
+        )
+        parts.append(arranged_instruments_context)
+
+    if instrument_knowledge:
+        parts.append("")
+        parts.append("INSTRUMENT KNOWLEDGE:")
+        parts.append(instrument_knowledge)
+
+    parts.append("")
+    parts.append(
+        "IMPORTANT: Write a DENSE, CONTINUOUS part. "
+        "Do NOT leave empty bars. "
+        "Use idiomatic intervals and techniques. "
+        "Do NOT write bare ascending/descending scales."
+    )
+
+    if density_heatmap:
+        parts.append("")
+        parts.append("CURRENT DENSITY (your previous output):")
+        parts.append(density_heatmap)
+
+    if gap_report:
+        parts.append("")
+        parts.append("GAP VIOLATIONS TO FIX:")
+        parts.append(gap_report)
+
+    if overlap_context:
+        parts.append("")
+        parts.append("TRANSITION CONTEXT (connect smoothly):")
+        parts.append(overlap_context)
+
+    if critic_feedback:
+        parts.append("")
+        parts.append("Critic feedback to address:")
+        parts.append(critic_feedback)
+
+    return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: Ensemble Critic
+# ---------------------------------------------------------------------------
+
+ENSEMBLE_CRITIC_SYSTEM = """You are the Ensemble Critic. \
+You evaluate the FULL orchestration: all instruments together.
+
+You will receive pre-computed metrics and gap reports. \
+RELY STRICTLY on these numbers.
+
+Output JSON:
+{
+  "overall_score": 0.75,
+  "passes": false,
+  "aspect_scores": {
+    "melodic_contour": 0.7,
+    "harmonic_quality": 0.8,
+    "rhythmic_interest": 0.7,
+    "arrangement": 0.6,
+    "section_contrast": 0.7,
+    "instrument_idiom": 0.7,
+    "density_coverage": 0.5,
+    "ensemble_balance": 0.6
+  },
+  "issues": [
+    {"aspect": "arrangement", "severity": "major",
+     "description": "Erhu and Guzheng play identical rhythm in chorus",
+     "suggestion": "Give Erhu a syncopated counter-melody"}
+  ],
+  "main_score_changes": null,
+  "instrument_reruns": ["erhu"],
+  "keep_instruments": ["guzheng", "cello", "dizi"],
+  "distribution_update": null,
+  "revision_instructions": "Specific instructions per instrument."
+}
+
+Evaluate the ENSEMBLE:
+- Do instruments complement each other or clash?
+- Is the overall texture balanced (not all in the same register)?
+- Do all instruments meet density minimums for their roles?
+- Is there a clear hierarchy (lead stands out, bass supports)?
+- Are section transitions smooth across the whole ensemble?
+- Does the piece tell a story (build-up, climax, resolution)?
+
+SELECTIVE RE-RUN LOGIC:
+- main_score_changes: set ONLY if the melody/chords themselves need fixing. \
+This triggers a full re-arrangement. Use sparingly.
+- instrument_reruns: list instruments that need re-arrangement.
+- keep_instruments: list instruments whose parts are satisfactory.
+- If ALL instruments are fine: set passes=true.
+- distribution_update: text guidance if instrument roles should shift \
+(e.g., "Erhu should double Guzheng melody in chorus").
+
+passes=true only when overall_score >= 0.80.
+Be SPECIFIC about which instruments need what changes."""
+
+
+def build_overlap_context(
+    score,
+    section_name: str,
+    enriched_sections: list[dict],
+    track_name: str | None = None,
+    beats_per_bar: int = 4,
+) -> str:
+    """Extract boundary notes for continuity enforcement.
+
+    Returns the last 4 beats of the previous section and first 4 beats
+    of the next section, with actual note data.
+    """
+    sec_idx = next(
+        (i for i, s in enumerate(enriched_sections) if s["name"] == section_name),
+        None,
+    )
+    if sec_idx is None:
+        return ""
+
+    parts = []
+
+    # Previous section tail
+    if sec_idx > 0:
+        prev = enriched_sections[sec_idx - 1]
+        prev_end = float(prev["end_beat"])
+        tail_start = max(float(prev["start_beat"]), prev_end - 4)
+        parts.append(
+            f"PREVIOUS SECTION [{prev['name'].upper()}] "
+            f"last 4 beats ({tail_start:.0f}-{prev_end:.0f}):"
+        )
+        tracks = [score.get_track(track_name)] if track_name else score.tracks
+        for trk in (t for t in tracks if t):
+            tail_notes = [
+                n for n in trk.notes
+                if tail_start <= n.start_beat < prev_end
+            ]
+            if tail_notes:
+                last = tail_notes[-1]
+                note_str = ", ".join(
+                    f"{_pitch_name(n.pitch)}@{n.start_beat}" for n in tail_notes
+                )
+                parts.append(f"  {trk.name}: {note_str}")
+                parts.append(
+                    f"  -> Last note: {_pitch_name(last.pitch)} at beat {last.start_beat}. "
+                    "Connect smoothly from here."
+                )
+            else:
+                parts.append(f"  {trk.name}: (silent)")
+
+    # Next section head
+    if sec_idx < len(enriched_sections) - 1:
+        nxt = enriched_sections[sec_idx + 1]
+        nxt_start = float(nxt["start_beat"])
+        head_end = min(float(nxt["end_beat"]), nxt_start + 4)
+        parts.append(
+            f"\nNEXT SECTION [{nxt['name'].upper()}] "
+            f"first 4 beats ({nxt_start:.0f}-{head_end:.0f}):"
+        )
+        tracks = [score.get_track(track_name)] if track_name else score.tracks
+        for trk in (t for t in tracks if t):
+            head_notes = [
+                n for n in trk.notes
+                if nxt_start <= n.start_beat < head_end
+            ]
+            if head_notes:
+                first = head_notes[0]
+                note_str = ", ".join(
+                    f"{_pitch_name(n.pitch)}@{n.start_beat}" for n in head_notes
+                )
+                parts.append(f"  {trk.name}: {note_str}")
+                parts.append(
+                    f"  -> First note: {_pitch_name(first.pitch)} at beat {first.start_beat}. "
+                    "Lead into this smoothly."
+                )
+            else:
+                parts.append(f"  {trk.name}: (not yet written)")
+
+    return "\n".join(parts)

@@ -12,8 +12,27 @@ from autogen_agentchat.messages import BaseChatMessage, TextMessage
 from autogen_core import CancellationToken
 from loguru import logger
 
-from src.llm.prompts import CRITIC_SYSTEM
+from src.llm.prompts import (
+    CRITIC_SYSTEM,
+    STRUCTURAL_CRITIC_SYSTEM,
+    INNER_CRITIC_SYSTEM,
+    ENSEMBLE_CRITIC_SYSTEM,
+)
 from config.settings import settings
+
+_MODE_PROMPTS = {
+    "general": CRITIC_SYSTEM,
+    "structural": STRUCTURAL_CRITIC_SYSTEM,
+    "inner": INNER_CRITIC_SYSTEM,
+    "ensemble": ENSEMBLE_CRITIC_SYSTEM,
+}
+
+_MODE_THRESHOLDS = {
+    "general": lambda s: s.critic_regen_threshold,
+    "structural": lambda s: s.critic_regen_threshold,
+    "inner": lambda s: s.critic_regen_threshold,
+    "ensemble": lambda s: s.critic_regen_threshold,
+}
 
 
 class CriticAgent(BaseChatAgent):
@@ -21,6 +40,14 @@ class CriticAgent(BaseChatAgent):
         super().__init__(name=name, description=description)
         self._model_client = model_client
         self._consecutive_low_scores = 0
+        self._mode = "general"
+
+    def set_mode(self, mode: str) -> None:
+        """Set critic mode: 'general', 'structural', 'inner', or 'ensemble'."""
+        if mode not in _MODE_PROMPTS:
+            raise ValueError(f"Unknown critic mode: {mode}. Valid: {list(_MODE_PROMPTS)}")
+        self._mode = mode
+        logger.info(f"[Critic] mode set to '{mode}'")
 
     @property
     def produced_message_types(self) -> Sequence[type[BaseChatMessage]]:
@@ -32,8 +59,9 @@ class CriticAgent(BaseChatAgent):
         logger.info(f"[Critic] called with {len(messages)} messages, context={len(context)} chars")
 
         from autogen_core.models import SystemMessage, UserMessage
+        system_prompt = _MODE_PROMPTS.get(self._mode, CRITIC_SYSTEM)
         llm_messages = [
-            SystemMessage(content=CRITIC_SYSTEM),
+            SystemMessage(content=system_prompt),
             UserMessage(
                 content=(
                     f"Review the following musical content. "
@@ -70,7 +98,9 @@ class CriticAgent(BaseChatAgent):
                 f"[Critic] score={score:.2f}, passes={passes}, "
                 f"regen={regen}, consecutive_low={self._consecutive_low_scores}"
             )
-            if score < settings.critic_regen_threshold:
+            threshold_fn = _MODE_THRESHOLDS.get(self._mode, lambda s: s.critic_regen_threshold)
+            regen_threshold = threshold_fn(settings)
+            if score < regen_threshold:
                 self._consecutive_low_scores += 1
             else:
                 self._consecutive_low_scores = 0

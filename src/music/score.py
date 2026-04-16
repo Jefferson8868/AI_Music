@@ -7,6 +7,9 @@ note-level detail for precise editing.
 
 from __future__ import annotations
 
+from dataclasses import dataclass, field
+from math import ceil
+
 from pydantic import BaseModel, Field
 
 
@@ -385,5 +388,275 @@ def format_metrics_for_critic(metrics: dict) -> str:
         f"- Lyrics alignment: {alignment}% of lyric beats "
         "match melody note positions"
     )
+
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# MainScore — the lead sheet that anchors the nested loop pipeline
+# ---------------------------------------------------------------------------
+
+@dataclass
+class MainScore:
+    """Lead sheet produced in Phase 2: melody + chords + rhythm guide + instrument plan."""
+
+    melody: list  # list of ScoreNote (or dicts with pitch/start_beat/duration_beats/velocity)
+    chord_progression: list = field(default_factory=list)     # [{bar, root, quality}]
+    rhythm_guide: dict = field(default_factory=dict)           # {section_name: "4-6 notes/bar"}
+    instrument_plan: dict = field(default_factory=dict)        # {instrument_name: role description}
+
+    def to_description(self, key: str = "C", scale_type: str = "major") -> str:
+        """Text summary of the lead sheet for injection into agent prompts."""
+        parts = [f"LEAD SHEET | key={key} {scale_type}"]
+
+        parts.append(f"\nMELODY ({len(self.melody)} notes):")
+        for n in self.melody[:20]:
+            p = n.pitch if hasattr(n, "pitch") else n.get("pitch", 0)
+            sb = n.start_beat if hasattr(n, "start_beat") else n.get("start_beat", 0)
+            dur = n.duration_beats if hasattr(n, "duration_beats") else n.get("duration_beats", 0)
+            parts.append(f"  {_pitch_name(p)} beat={sb} dur={dur}")
+        if len(self.melody) > 20:
+            parts.append(f"  ... ({len(self.melody) - 20} more)")
+
+        if self.chord_progression:
+            parts.append("\nCHORD PROGRESSION:")
+            for c in self.chord_progression:
+                parts.append(f"  bar {c.get('bar', '?')}: {c.get('root', '?')}{c.get('quality', '')}")
+
+        if self.rhythm_guide:
+            parts.append("\nRHYTHM GUIDE:")
+            for sec, desc in self.rhythm_guide.items():
+                parts.append(f"  {sec}: {desc}")
+
+        if self.instrument_plan:
+            parts.append("\nINSTRUMENT PLAN:")
+            for inst, role in self.instrument_plan.items():
+                parts.append(f"  {inst}: {role}")
+
+        return "\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Agent Inspection Tools — density, gaps, grids, register coverage
+# ---------------------------------------------------------------------------
+
+def _count_notes_in_bar(notes: list, bar_start: float, bar_end: float) -> int:
+    """Count notes whose start_beat falls within [bar_start, bar_end)."""
+    return sum(1 for n in notes if bar_start <= n.start_beat < bar_end)
+
+
+def compute_density_heatmap(score: Score, beats_per_bar: int | None = None) -> str:
+    """Bar-by-bar note density per track with ASCII bars and gap warnings."""
+    if beats_per_bar is None:
+        beats_per_bar = score.time_signature[0] if score.time_signature else 4
+    total_bars = ceil(score.total_beats / beats_per_bar) if score.total_beats > 0 else 0
+    if total_bars == 0 or not score.tracks:
+        return "DENSITY HEATMAP: (empty score)"
+
+    max_display = 8  # max blocks in ASCII bar
+
+    lines = ["DENSITY HEATMAP (notes per bar):"]
+    # header
+    track_names = [t.name for t in score.tracks]
+    header = f"{'Bar':>5} | " + " | ".join(f"{tn[:10]:^14}" for tn in track_names)
+    lines.append(header)
+    lines.append("-" * len(header))
+
+    for bar_idx in range(total_bars):
+        bar_start = bar_idx * beats_per_bar
+        bar_end = bar_start + beats_per_bar
+        cells = []
+        bar_gap = True
+        for trk in score.tracks:
+            count = _count_notes_in_bar(trk.notes, bar_start, bar_end)
+            blocks = min(count, max_display)
+            bar_str = "\u2588" * blocks + "\u2591" * (max_display - blocks)
+            cells.append(f"{bar_str} ({count})")
+            if count > 0:
+                bar_gap = False
+        flag = "  \u26a0\ufe0f GAP" if bar_gap else ""
+        lines.append(f"{bar_idx + 1:>5} | " + " | ".join(cells) + flag)
+
+    return "\n".join(lines)
+
+
+def compute_note_grid(
+    score: Score,
+    track_name: str,
+    start_bar: int,
+    end_bar: int,
+    beats_per_bar: int | None = None,
+) -> str:
+    """Text piano-roll for a specific track within a bar range.
+
+    Bars are 1-indexed. Shows beat positions, note names, durations, velocities.
+    """
+    if beats_per_bar is None:
+        beats_per_bar = score.time_signature[0] if score.time_signature else 4
+    trk = score.get_track(track_name)
+    if not trk:
+        return f"NOTE GRID: track '{track_name}' not found"
+
+    grid_step = 0.5  # half-beat resolution
+    lines = [f"NOTE GRID: {track_name} ({trk.instrument}), bars {start_bar}-{end_bar}"]
+
+    for bar in range(start_bar, end_bar + 1):
+        bar_start = (bar - 1) * beats_per_bar
+        bar_end = bar_start + beats_per_bar
+        notes_in_bar = [n for n in trk.notes if bar_start <= n.start_beat < bar_end]
+        notes_in_bar.sort(key=lambda n: n.start_beat)
+
+        beats = []
+        beat = float(bar_start)
+        while beat < bar_end:
+            beats.append(beat)
+            beat += grid_step
+
+        beat_strs = [f"{b:>5.1f}" for b in beats]
+        note_strs = []
+        dur_strs = []
+        vel_strs = []
+
+        for b in beats:
+            hit = next((n for n in notes_in_bar if abs(n.start_beat - b) < 0.01), None)
+            if hit:
+                note_strs.append(f"{_pitch_name(hit.pitch):>5}")
+                dur_strs.append(f"{hit.duration_beats:>5.2f}")
+                vel_strs.append(f"{hit.velocity:>5}")
+            else:
+                note_strs.append("  ---")
+                dur_strs.append("     ")
+                vel_strs.append("     ")
+
+        lines.append(f"\n  Bar {bar} (beats {bar_start:.0f}-{bar_end:.0f}):")
+        lines.append("  beat: " + " ".join(beat_strs))
+        lines.append("  note: " + " ".join(note_strs))
+        lines.append("  dur:  " + " ".join(dur_strs))
+        lines.append("  vel:  " + " ".join(vel_strs))
+
+    return "\n".join(lines)
+
+
+def detect_gaps(
+    score: Score,
+    role_density_minimums: dict[str, int],
+    beats_per_bar: int | None = None,
+) -> str:
+    """Detect bars below minimum density per instrument role.
+
+    Args:
+        role_density_minimums: {"lead": 4, "counter-melody": 2, ...}
+
+    Returns text report of violations, or empty string if clean.
+    """
+    if beats_per_bar is None:
+        beats_per_bar = score.time_signature[0] if score.time_signature else 4
+    total_bars = ceil(score.total_beats / beats_per_bar) if score.total_beats > 0 else 0
+    if total_bars == 0:
+        return ""
+
+    violations: list[str] = []
+    total_below = 0
+
+    for trk in score.tracks:
+        role_key = trk.role.lower().replace(" ", "-").replace("_", "-")
+        min_density = role_density_minimums.get(role_key, 0)
+        if min_density == 0:
+            for rk, rv in role_density_minimums.items():
+                if rk in role_key or role_key in rk:
+                    min_density = rv
+                    break
+        if min_density == 0:
+            continue
+
+        gap_bars = []
+        for bar_idx in range(total_bars):
+            bar_start = bar_idx * beats_per_bar
+            bar_end = bar_start + beats_per_bar
+            count = _count_notes_in_bar(trk.notes, bar_start, bar_end)
+            if count < min_density:
+                gap_bars.append(bar_idx + 1)
+
+        if gap_bars:
+            ranges = _compress_bar_ranges(gap_bars)
+            violations.append(
+                f"  {trk.name} ({trk.instrument}, {trk.role}): "
+                f"bars {ranges} below min {min_density} notes/bar"
+            )
+            total_below += len(gap_bars)
+
+    if not violations:
+        return ""
+
+    lines = [
+        f"\u26a0\ufe0f GAPS DETECTED ({total_below} of {total_bars * len(score.tracks)} "
+        f"track-bars below minimum):"
+    ]
+    lines.extend(violations)
+    return "\n".join(lines)
+
+
+def _compress_bar_ranges(bars: list[int]) -> str:
+    """Compress [1,2,3,5,7,8] into '1-3, 5, 7-8'."""
+    if not bars:
+        return ""
+    ranges = []
+    start = bars[0]
+    prev = bars[0]
+    for b in bars[1:]:
+        if b == prev + 1:
+            prev = b
+        else:
+            ranges.append(f"{start}-{prev}" if start != prev else str(start))
+            start = b
+            prev = b
+    ranges.append(f"{start}-{prev}" if start != prev else str(start))
+    return ", ".join(ranges)
+
+
+def compute_register_coverage(
+    score: Score,
+    instrument_ranges: dict[str, tuple[int, int]],
+) -> str:
+    """Show octave usage per instrument against expected sweet-spot range.
+
+    Args:
+        instrument_ranges: {"Guzheng": (55, 84), "Erhu": (55, 93), ...}
+    """
+    if not score.tracks:
+        return "REGISTER COVERAGE: (no tracks)"
+
+    total_display = 14  # total ASCII cells for C1(24) to C7(96)
+    lo_midi = 24
+    hi_midi = 96
+    span = hi_midi - lo_midi
+
+    lines = ["REGISTER COVERAGE:"]
+    for trk in score.tracks:
+        pitches = [n.pitch for n in trk.notes]
+        if not pitches:
+            lines.append(f"  {trk.name} ({trk.instrument}): (no notes)")
+            continue
+
+        actual_lo = min(pitches)
+        actual_hi = max(pitches)
+
+        cells = ["\u2591"] * total_display
+        for p in range(actual_lo, actual_hi + 1):
+            idx = int((p - lo_midi) / span * (total_display - 1))
+            idx = max(0, min(total_display - 1, idx))
+            cells[idx] = "\u2588"
+
+        bar_str = "".join(cells)
+        range_str = f"{_pitch_name(actual_lo)}-{_pitch_name(actual_hi)}"
+
+        expected = instrument_ranges.get(trk.instrument)
+        if expected:
+            sweet_lo, sweet_hi = expected
+            in_sweet = sweet_lo <= actual_lo and actual_hi <= sweet_hi
+            check = "\u2713" if in_sweet else f"expected {_pitch_name(sweet_lo)}-{_pitch_name(sweet_hi)}"
+            lines.append(f"  {trk.name} ({trk.instrument}): {bar_str} ({range_str}, {check})")
+        else:
+            lines.append(f"  {trk.name} ({trk.instrument}): {bar_str} ({range_str})")
 
     return "\n".join(lines)
