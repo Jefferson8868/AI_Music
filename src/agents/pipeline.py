@@ -105,6 +105,9 @@ _CHINESE_INSTRUMENT_GM = {
     "piano": 0, "grand piano": 0,
     "strings": 48, "pad": 89, "flute": 73,
     "acoustic guitar": 24, "nylon guitar": 24,
+    "electric guitar": 27, "e-guitar": 27, "distortion guitar": 30,
+    "electric bass": 34, "bass guitar": 33, "synth bass": 38,
+    "drum kit": 0, "drums": 0,
     "cello": 42, "violin": 40, "viola": 41, "contrabass": 43,
 }
 
@@ -113,6 +116,10 @@ _GM_PITCH_RANGES = {
     "cello": (36, 76), "contrabass": (28, 67), "flute": (60, 96),
     "guzheng": (43, 96), "erhu": (55, 91), "dizi": (60, 96),
     "pipa": (45, 93), "xiao": (55, 84),
+    "electric guitar": (40, 88), "e-guitar": (40, 88),
+    "electric bass": (28, 55), "bass guitar": (28, 55),
+    "synth bass": (28, 64),
+    "drums": (35, 81), "drum kit": (35, 81),
 }
 
 

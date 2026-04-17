@@ -36,13 +36,12 @@ HARMONY & GROOVE
 - 4/4, danceable backbeat; tempo ~100–112 BPM feel; syncopation in verse OK.
 - Pre-chorus should build energy; chorus is the peak (biggest drums energy, widest chords).
 
-ORCHESTRATION (Western only)
-- Lead melody: clear pop vocal line (represented as a bright lead instrument — use Piano
-  or Violin for the main hook so it reads in MIDI).
-- Chords: Piano (rhythmic comp, not sparse whole-note blocks every bar).
-- Bass: walking or root–fifth pop bass on Cello or Contrabass (low register, supportive).
-- Pad / lift: Strings ensemble for chorus width.
-- Optional sparkle: subtle Flute or high Piano doubles on chorus hook (light, not busy).
+ORCHESTRATION (modern band — Western only)
+- Drums: kick/snare/hi-hat pop groove; busier in chorus than verse; fills into sections.
+- Electric Bass: syncopated root patterns, root–fifth motion, lock with kick.
+- Electric Guitar: rhythmic chord stabs, palm-muted patterns in verse; wider voicings in chorus.
+- Piano: main melodic hook (vocal line surrogate) — bright, singable, syncopated.
+- Synth Pad: wide stereo wash, swells into chorus and pre-chorus.
 
 AVOID
 - Pentatonic “Chinese garden” clichés, traditional Asian scales as the default, or
@@ -85,10 +84,10 @@ def build_request_payload(
             "reference_style": "Contemporary Western chart pop (catchy hooks, big chorus)",
             "instruments": [
                 {"name": "Piano", "role": "lead"},
-                {"name": "Violin", "role": "counter-melody"},
-                {"name": "Acoustic Guitar", "role": "chords"},
-                {"name": "Strings", "role": "pad"},
-                {"name": "Cello", "role": "bass"},
+                {"name": "Electric Guitar", "role": "chords"},
+                {"name": "Electric Bass", "role": "bass"},
+                {"name": "Drums", "role": "drums"},
+                {"name": "Pad", "role": "pad"},
             ],
         }
     }
