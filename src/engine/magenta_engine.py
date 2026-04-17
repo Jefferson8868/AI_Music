@@ -45,9 +45,14 @@ class MagentaEngine(MusicEngineInterface):
 
 
 def create_engine() -> MusicEngineInterface:
-    engine_type = settings.music_engine
-    if engine_type == "magenta":
-        return MagentaEngine()
-    else:
-        logger.warning(f"Unknown engine '{engine_type}', falling back to Magenta")
-        return MagentaEngine()
+    """Backwards-compatible entry point.
+
+    Historically this function only knew about Magenta. Real engine
+    dispatch now lives in `src.engine.factory.create_engine` which
+    honours `settings.music_engine` and supports musiclang / amt /
+    null / multi:*. We delegate here so legacy imports
+    (`from src.engine.magenta_engine import create_engine`) continue
+    to work.
+    """
+    from src.engine.factory import create_engine as _factory_create_engine
+    return _factory_create_engine()

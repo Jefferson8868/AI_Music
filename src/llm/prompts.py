@@ -129,6 +129,7 @@ def build_composer_section_prompt(
     featured_instruments: list[str] | None = None,
     ornament_vocabulary: list[str] | None = None,
     continuity_profiles: dict[str, dict] | None = None,
+    theory_hints: list[str] | None = None,
 ) -> str:
     """Build a focused prompt for composing ONE section.
 
@@ -321,6 +322,15 @@ def build_composer_section_prompt(
             "ornaments that MATCH the instrument — e.g. breath_swell "
             "for dizi, vibrato_deep for erhu, tremolo_rapid for pipa."
         )
+
+    if theory_hints:
+        parts.append("")
+        parts.append(
+            "THEORY CONTEXT (drawn from the knowledge library, use as "
+            "guardrails):"
+        )
+        for hint in theory_hints:
+            parts.append(f"- {hint}")
 
     if instrument_knowledge:
         parts.append("")
@@ -528,6 +538,10 @@ You will receive pre-computed metrics (note counts, density, contrast, \
 lyrics alignment). RELY STRICTLY on these numbers. \
 Do NOT count notes yourself.
 
+If a DELTA block is present, it shows what changed from the previous \
+round. Use it to judge whether the latest revisions actually moved \
+the relevant aspects, and call out regressions explicitly.
+
 Output JSON:
 {
   "overall_score": 0.7,
@@ -540,13 +554,16 @@ Output JSON:
     "section_contrast": 0.5,
     "instrument_idiom": 0.5,
     "ensemble_spotlight": 0.5,
+    "continuity": 0.5,
     "lyrics_quality": 0.6,
     "lyrics_alignment": 0.5
   },
   "issues": [
     {"aspect": "instrument_idiom", "severity": "major",
      "description": "Guzheng plays bare ascending scale",
-     "suggestion": "Use pentatonic intervals with ornamental slides"}
+     "suggestion": "Use pentatonic intervals with ornamental slides",
+     "target_sections": ["chorus"],
+     "target_instruments": ["Guzheng"]}
   ],
   "spotlight_proposals": [
     {"section": "chorus",
@@ -554,8 +571,37 @@ Output JSON:
      "reasoning": "Chorus feels empty; Erhu would carry the climax",
      "confidence": 0.85}
   ],
-  "revision_instructions": "Specific instructions for each agent."
+  "revision_instructions": "Overall summary for humans.",
+  "agent_revisions": {
+    "composer":       "Per-section fixes for Composer (required).",
+    "instrumentalist":"Ornament/articulation fixes (required).",
+    "lyricist":       "Lyric fixes per section (required)."
+  },
+  "section_revisions": {
+    "verse":  "What to fix in the verse.",
+    "chorus": "What to fix in the chorus."
+  },
+  "plateau_warning": false
 }
+
+Scoring weights (use these when computing overall_score):
+  melodic_contour     : 0.10
+  harmonic_quality    : 0.15
+  rhythmic_interest   : 0.10
+  arrangement         : 0.10
+  section_contrast    : 0.10
+  instrument_idiom    : 0.15
+  ensemble_spotlight  : 0.10
+  continuity          : 0.10
+  lyrics_quality      : 0.05
+  lyrics_alignment    : 0.05
+
+overall_score = weighted sum. Prefer small, targeted score differences \
+to everything-is-0.6 averages — each aspect must be justified by the \
+metrics + score summary. If two consecutive rounds show the same \
+aspect unchanged despite revision instructions, set \
+plateau_warning=true and write a MORE SPECIFIC agent_revisions block \
+(name sections and instruments explicitly).
 
 Focus on QUALITATIVE musical judgment:
 - Is the melodic contour interesting or repetitive?
@@ -597,8 +643,13 @@ Reference section names and instrument names explicitly."""
 def build_critic_prompt(
     instrument_criteria: list[str] | None = None,
     current_spotlight: list[dict] | None = None,
+    theory_hints: list[str] | None = None,
 ) -> str:
-    """Build Critic context with instrument-specific evaluation criteria."""
+    """Build Critic context with instrument-specific evaluation criteria.
+
+    theory_hints: 1-line passages from the knowledge library that the
+        critic can reference when judging harmonic / spotlight quality.
+    """
     parts = [CRITIC_SYSTEM]
     if instrument_criteria:
         parts.append("")
@@ -623,6 +674,11 @@ def build_critic_prompt(
             parts.append(
                 f"  {sec}: active=[{act}] featured=[{feat}]"
             )
+    if theory_hints:
+        parts.append("")
+        parts.append("THEORY CONTEXT (evaluate against these guardrails):")
+        for hint in theory_hints:
+            parts.append(f"- {hint}")
     return "\n".join(parts)
 
 

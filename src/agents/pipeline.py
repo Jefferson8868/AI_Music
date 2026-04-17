@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Awaitable
 
@@ -41,6 +42,10 @@ from src.knowledge.instruments import (
     format_for_critic,
     get_continuity_profile,
     get_ornament_vocabulary,
+)
+from src.knowledge.query_machine import (
+    get_default_machine as get_knowledge_machine,
+    theory_hints_for_request,
 )
 from src.knowledge.spotlight_presets import (
     build_default_all_active,
@@ -547,6 +552,157 @@ def _apply_proposal_to_plan(
             f"+{prop.add_instruments} -{prop.remove_instruments}"
         )
     return changed
+
+
+# ---------------------------------------------------------------------------
+# Critic feedback routing (Improvement E)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class CriticRound:
+    """One round's parsed critic output."""
+
+    overall_score: float = 0.0
+    aspect_scores: dict[str, float] = field(default_factory=dict)
+    passes: bool = False
+    agent_revisions: dict[str, str] = field(default_factory=dict)
+    section_revisions: dict[str, str] = field(default_factory=dict)
+    issues: list[dict] = field(default_factory=list)
+    raw_instructions: str = ""
+    plateau_warning: bool = False
+
+
+def _parse_critic_round(data: dict) -> CriticRound:
+    """Parse a critic JSON blob into CriticRound (tolerant to missing keys)."""
+    round_out = CriticRound()
+    try:
+        round_out.overall_score = float(data.get("overall_score", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        round_out.overall_score = 0.0
+    aspects = data.get("aspect_scores") or {}
+    if isinstance(aspects, dict):
+        for k, v in aspects.items():
+            try:
+                round_out.aspect_scores[str(k)] = float(v)
+            except (TypeError, ValueError):
+                continue
+    round_out.passes = bool(data.get("passes", False))
+    round_out.raw_instructions = str(data.get("revision_instructions", ""))
+    round_out.plateau_warning = bool(data.get("plateau_warning", False))
+    ar = data.get("agent_revisions") or {}
+    if isinstance(ar, dict):
+        for k, v in ar.items():
+            if isinstance(v, str) and v.strip():
+                round_out.agent_revisions[str(k).lower()] = v.strip()
+    sr = data.get("section_revisions") or {}
+    if isinstance(sr, dict):
+        for k, v in sr.items():
+            if isinstance(v, str) and v.strip():
+                round_out.section_revisions[str(k).lower()] = v.strip()
+    issues = data.get("issues") or []
+    if isinstance(issues, list):
+        for iss in issues:
+            if isinstance(iss, dict):
+                round_out.issues.append(iss)
+    # Backfill section_revisions from issue.target_sections if critic
+    # forgot to fill section_revisions explicitly.
+    if not round_out.section_revisions and round_out.issues:
+        for iss in round_out.issues:
+            targets = iss.get("target_sections") or []
+            desc = iss.get("description", "") or ""
+            suggestion = iss.get("suggestion", "") or ""
+            msg_core = " ".join(
+                filter(None, [desc, suggestion])
+            ).strip()
+            if not msg_core:
+                continue
+            if isinstance(targets, list):
+                for t in targets:
+                    if not isinstance(t, str):
+                        continue
+                    key = t.lower().strip()
+                    if not key:
+                        continue
+                    prev = round_out.section_revisions.get(key, "")
+                    round_out.section_revisions[key] = (
+                        (prev + " " if prev else "") + msg_core
+                    )
+    # Backfill agent_revisions from raw_instructions if agent_revisions
+    # is empty — legacy critics dump everything into one string.
+    if not round_out.agent_revisions and round_out.raw_instructions:
+        round_out.agent_revisions["composer"] = round_out.raw_instructions
+        round_out.agent_revisions["instrumentalist"] = (
+            round_out.raw_instructions
+        )
+        round_out.agent_revisions["lyricist"] = round_out.raw_instructions
+    return round_out
+
+
+def _feedback_for_section(
+    critic_round: CriticRound | None, section_name: str,
+) -> str:
+    """Return the per-section feedback text for the Composer.
+
+    Falls back to the generic agent_revisions['composer'] + overall
+    instructions so section 0 is NOT the only one that sees guidance
+    (the old bug).
+    """
+    if critic_round is None:
+        return ""
+    section_key = (section_name or "").lower().strip()
+    chunks: list[str] = []
+    sec_msg = critic_round.section_revisions.get(section_key, "")
+    if sec_msg:
+        chunks.append(f"[{section_name}] {sec_msg}")
+    composer_msg = critic_round.agent_revisions.get("composer", "")
+    if composer_msg and composer_msg not in chunks:
+        chunks.append(composer_msg)
+    # Also surface high-severity issues matching this section.
+    for iss in critic_round.issues:
+        sev = str(iss.get("severity", "")).lower()
+        tgts = [
+            str(t).lower() for t in (iss.get("target_sections") or [])
+        ]
+        if sev in ("major", "critical") and section_key in tgts:
+            desc = iss.get("description", "")
+            sugg = iss.get("suggestion", "")
+            if desc or sugg:
+                chunks.append(f"! {desc} → {sugg}".strip())
+    return "\n".join(chunks).strip()
+
+
+def _build_delta_block(
+    current: CriticRound | None, previous: CriticRound | None,
+) -> str:
+    """Render a DELTA block showing changes from the previous round.
+
+    Returns an empty string if either round is missing.
+    """
+    if not current or not previous:
+        return ""
+    lines: list[str] = ["DELTA FROM PREVIOUS ROUND:"]
+    d_overall = current.overall_score - previous.overall_score
+    sign = "+" if d_overall >= 0 else ""
+    lines.append(
+        f"  overall_score: {previous.overall_score:.2f} -> "
+        f"{current.overall_score:.2f} ({sign}{d_overall:.2f})"
+    )
+    all_aspects = set(current.aspect_scores) | set(previous.aspect_scores)
+    for aspect in sorted(all_aspects):
+        cur = current.aspect_scores.get(aspect, 0.0)
+        pre = previous.aspect_scores.get(aspect, 0.0)
+        diff = cur - pre
+        sign = "+" if diff >= 0 else ""
+        lines.append(
+            f"  {aspect}: {pre:.2f} -> {cur:.2f} "
+            f"({sign}{diff:.2f})"
+        )
+    if current.plateau_warning:
+        lines.append(
+            "  plateau_warning=true — scores stuck; push for "
+            "SPECIFIC revisions this round."
+        )
+    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -1129,7 +1285,14 @@ class MusicGenerationPipeline:
             # ---- Phase 2: Collaborative Refinement Loop ----
             logger.info("=== Phase 2: Collaborative Refinement ===")
             max_rounds = settings.max_refinement_rounds
+            # critic_feedback kept as a plain string for legacy callers;
+            # the structured CriticRound carries per-section / per-agent
+            # routing (Improvement E).
             critic_feedback = ""
+            critic_round_current: CriticRound | None = None
+            critic_round_previous: CriticRound | None = None
+            # Plateau detection: remember overall_score history.
+            score_history: list[float] = []
 
             for rnd in range(1, max_rounds + 1):
                 base_progress = 0.15 + (
@@ -1208,6 +1371,37 @@ class MusicGenerationPipeline:
                         if prof:
                             continuity_profiles[iname] = prof
 
+                    # Pull a small set of theory hints from the
+                    # knowledge machine. Cheap (local curated keyword
+                    # search); cached per pipeline call via the
+                    # module-level singleton.
+                    req_genre = (
+                        getattr(request, "genre", None) or ""
+                    )
+                    try:
+                        sec_theory_hints = theory_hints_for_request(
+                            genre=req_genre,
+                            agent_name="composer",
+                            extra_question=(
+                                f"{sec['name']} {sec.get('mood', '')} "
+                                f"{key} {scale_type}"
+                            ),
+                            max_results=3,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "Knowledge query failed: %s", exc,
+                        )
+                        sec_theory_hints = []
+
+                    # Per-section critic feedback (fixes the "only
+                    # section 0 sees guidance" bug). Falls back to the
+                    # generic composer-wide instructions when no
+                    # section-specific message exists.
+                    section_feedback = _feedback_for_section(
+                        critic_round_current, sec["name"],
+                    ) or critic_feedback
+
                     section_prompt = build_composer_section_prompt(
                         section_name=sec["name"],
                         start_beat=sec["start_beat"],
@@ -1221,14 +1415,13 @@ class MusicGenerationPipeline:
                         draft_description=(
                             draft_description if rnd == 1 else ""
                         ),
-                        critic_feedback=(
-                            critic_feedback if si == 0 else ""
-                        ),
+                        critic_feedback=section_feedback,
                         instrument_knowledge=inst_knowledge,
                         active_instruments=active_instruments,
                         featured_instruments=featured_instruments,
                         ornament_vocabulary=ornament_vocab,
                         continuity_profiles=continuity_profiles,
+                        theory_hints=sec_theory_hints,
                     )
 
                     comp_resp = await self._call_agent(
@@ -1370,9 +1563,20 @@ class MusicGenerationPipeline:
                         )[:1500]
                         + "\n\n"
                     )
-                if critic_feedback:
+                lyr_feedback = ""
+                if critic_round_current is not None:
+                    lyr_feedback = (
+                        critic_round_current.agent_revisions.get(
+                            "lyricist", "",
+                        )
+                        or critic_feedback
+                    )
+                else:
+                    lyr_feedback = critic_feedback
+                if lyr_feedback:
                     lyricist_context += (
-                        f"Critic feedback:\n{critic_feedback}\n\n"
+                        f"Critic feedback (for lyricist):\n"
+                        f"{lyr_feedback}\n\n"
                     )
                 lyricist_context += (
                     "Write or revise lyrics. "
@@ -1511,6 +1715,25 @@ class MusicGenerationPipeline:
                         f"{sec['start_beat']:.0f}"
                         f"-{sec['end_beat']:.0f}\n"
                     )
+                # Per-agent critic routing (Improvement E): give the
+                # Instrumentalist its dedicated revisions slice instead of
+                # letting it see only the "composer" feedback by accident.
+                inst_feedback = ""
+                if critic_round_current is not None:
+                    inst_feedback = (
+                        critic_round_current.agent_revisions.get(
+                            "instrumentalist", "",
+                        )
+                        or critic_feedback
+                    )
+                else:
+                    inst_feedback = critic_feedback
+                if inst_feedback:
+                    inst_context += (
+                        "\nCritic feedback (for instrumentalist):\n"
+                        f"{inst_feedback}\n\n"
+                    )
+
                 inst_context += (
                     "\nAssign instruments, MIDI channels, "
                     "GM program numbers, and articulations. "
@@ -1615,13 +1838,73 @@ class MusicGenerationPipeline:
                     )
                 critic_context += "\n"
 
+                # Inject theory hints for the critic role — they sharpen
+                # rubric-based judgments (harmony, spotlight, continuity,
+                # ornaments).
+                req_genre_for_critic = (
+                    getattr(request, "genre", None) or ""
+                )
+                try:
+                    critic_hints = theory_hints_for_request(
+                        genre=req_genre_for_critic,
+                        agent_name="critic",
+                        extra_question="evaluation rubric "
+                        + req_genre_for_critic,
+                        max_results=4,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Critic theory hint query failed: %s", exc,
+                    )
+                    critic_hints = []
+                if critic_hints:
+                    critic_context += (
+                        "\nTHEORY CONTEXT (evaluate against these):\n"
+                    )
+                    for hint in critic_hints:
+                        critic_context += f"- {hint}\n"
+                    critic_context += "\n"
+
+                # Improvement E: show the critic how scores moved vs. the
+                # previous round. This gives the critic iteration memory
+                # so it can reason about "what changed, what didn't" and
+                # issue SPECIFIC revisions rather than restating generic
+                # observations.
+                delta_block = _build_delta_block(
+                    critic_round_current, critic_round_previous,
+                )
+                if delta_block:
+                    critic_context += "\n" + delta_block + "\n"
+
+                # Plateau detection: if the last 3 overall_scores are
+                # within 0.03 we're stuck — tell the critic to break the
+                # loop with more concrete, per-section demands.
+                plateau_hit = (
+                    len(score_history) >= 3
+                    and max(score_history[-3:])
+                    - min(score_history[-3:]) < 0.03
+                )
+                if plateau_hit:
+                    critic_context += (
+                        "\nPLATEAU DETECTED: the last 3 rounds' "
+                        "overall_scores are within 0.03 of each other. "
+                        "DO NOT restate generic observations. Pick the "
+                        "ONE weakest section and the ONE weakest "
+                        "instrument and demand a SPECIFIC change. "
+                        "Set plateau_warning=true in your JSON so "
+                        "downstream agents know to prioritize.\n"
+                    )
+
                 critic_context += (
                     "Evaluate the music AND lyrics together. "
                     "Use the metrics above as facts. "
                     "Focus on qualitative musical judgment. "
                     "Check instrument_idiom using the criteria "
                     "above. Check ensemble_spotlight against the plan. "
-                    "Emit spotlight_proposals if the plan should change."
+                    "Emit spotlight_proposals if the plan should change. "
+                    "Populate agent_revisions (composer / instrumentalist "
+                    "/ lyricist) and section_revisions (per section) so "
+                    "your feedback routes to the right collaborator."
                 )
 
                 crit_resp = await self._call_agent(
@@ -1639,20 +1922,68 @@ class MusicGenerationPipeline:
                 critic_proposals: list[
                     tuple[str, SpotlightProposal]
                 ] = []
+                # Improvement E: parse into CriticRound so the NEXT
+                # composer/instrumentalist/lyricist calls can pull
+                # per-agent + per-section revisions instead of all sharing
+                # one string.
+                new_round: CriticRound | None = None
                 for data in _find_json_objects(crit_resp):
-                    passes = data.get("passes", False)
-                    critic_feedback = data.get(
-                        "revision_instructions", "",
-                    )
-                    score_val = data.get("overall_score", 0)
+                    parsed = _parse_critic_round(data)
+                    if new_round is None:
+                        new_round = parsed
+                    else:
+                        # Later JSON blobs in the same response overwrite
+                        # earlier ones for scalar fields but merge lists.
+                        if parsed.overall_score:
+                            new_round.overall_score = parsed.overall_score
+                        if parsed.aspect_scores:
+                            new_round.aspect_scores.update(
+                                parsed.aspect_scores,
+                            )
+                        new_round.passes = new_round.passes or parsed.passes
+                        new_round.plateau_warning = (
+                            new_round.plateau_warning
+                            or parsed.plateau_warning
+                        )
+                        if parsed.raw_instructions:
+                            new_round.raw_instructions = (
+                                parsed.raw_instructions
+                            )
+                        new_round.agent_revisions.update(
+                            parsed.agent_revisions,
+                        )
+                        new_round.section_revisions.update(
+                            parsed.section_revisions,
+                        )
+                        new_round.issues.extend(parsed.issues)
                     for prop in _extract_spotlight_proposals_from_json(
                         data,
                     ):
                         critic_proposals.append(("critic", prop))
+
+                if new_round is not None:
+                    critic_round_previous = critic_round_current
+                    critic_round_current = new_round
+                    passes = new_round.passes
+                    critic_feedback = new_round.raw_instructions
+                    score_history.append(new_round.overall_score)
                     logger.info(
                         f"[Round {rnd}] Critic "
-                        f"score={score_val}, "
-                        f"passes={passes}"
+                        f"score={new_round.overall_score:.2f}, "
+                        f"passes={passes}, "
+                        f"agent_targets="
+                        f"{sorted(new_round.agent_revisions.keys())}, "
+                        f"section_targets="
+                        f"{sorted(new_round.section_revisions.keys())}"
+                    )
+                    if plateau_hit:
+                        # If our client-side detector fired, force-mark the
+                        # flag so downstream agents treat this as such.
+                        critic_round_current.plateau_warning = True
+                else:
+                    logger.warning(
+                        f"[Round {rnd}] Critic returned no parseable "
+                        "JSON — keeping previous round state."
                     )
 
                 if critic_proposals:
