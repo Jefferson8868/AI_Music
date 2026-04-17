@@ -128,6 +128,7 @@ def build_composer_section_prompt(
     active_instruments: list[str] | None = None,
     featured_instruments: list[str] | None = None,
     ornament_vocabulary: list[str] | None = None,
+    continuity_profiles: dict[str, dict] | None = None,
 ) -> str:
     """Build a focused prompt for composing ONE section.
 
@@ -137,6 +138,11 @@ def build_composer_section_prompt(
         featured_instruments: subset of active that should be foregrounded.
         ornament_vocabulary: list of ornament macro tokens the Composer can
             attach to notes in this section (via note.ornaments list).
+        continuity_profiles: mapping of active instrument name → continuity
+            profile dict (style / min_section_coverage_pct / max_gap_beats /
+            phrase_grouping_hint). Surfaced as an explicit CONTINUITY RULES
+            block so SUPPORTING tracks can't drift into note-per-bar
+            patterns just because they're not FEATURED.
     """
     # Filter the blueprint's instrument list by active_instruments.
     if active_instruments is None:
@@ -229,6 +235,77 @@ def build_composer_section_prompt(
             "instrument's register and never steal melody during "
             "its phrases."
         )
+
+    if continuity_profiles:
+        parts.append("")
+        parts.append(
+            "CONTINUITY RULES (critical — fixes 'note-by-note' "
+            "supporting parts):"
+        )
+        parts.append(
+            "Every active instrument has a continuity style. Even "
+            "SUPPORTING tracks must play continuously — they are NOT "
+            "allowed to emit a single beat and then sit silent for "
+            "bars. Respect each instrument's per-section coverage "
+            "target and max-gap, and group notes into PHRASES, not "
+            "isolated single beats."
+        )
+        section_beats = max(1.0, float(end_beat) - float(start_beat))
+        for inst_name, prof in continuity_profiles.items():
+            if not prof:
+                continue
+            style = prof.get("style", "rhythmic_comp")
+            cov = prof.get("min_section_coverage_pct", 60)
+            max_gap = prof.get("max_gap_beats", 2.0)
+            hint = prof.get("phrase_grouping_hint", "")
+            target_beats = round(section_beats * float(cov) / 100.0, 2)
+            parts.append(
+                f"  - {inst_name} [{style}]: cover at least ~"
+                f"{target_beats} of {section_beats:.1f} beats "
+                f"(>= {cov}%); no gap longer than {max_gap} beats "
+                f"between consecutive notes."
+            )
+            if hint:
+                parts.append(f"      → {hint}")
+        # Style-aware extra guidance
+        styles_in_section = {
+            (p or {}).get("style") for p in continuity_profiles.values()
+        }
+        if "continuous_breath" in styles_in_section:
+            parts.append(
+                "  Continuous-breath instruments (dizi, xiao, flute, "
+                "clarinet, trumpet): NEVER emit isolated single-beat "
+                "notes with bar-long gaps. Use breath_swell on "
+                "entrances and legato_to_next to connect."
+            )
+        if "continuous_bowed" in styles_in_section:
+            parts.append(
+                "  Continuous-bowed instruments (erhu, violin, viola, "
+                "cello, contrabass): carry phrases with legato and "
+                "vibrato; silence within a phrase means you lifted "
+                "the bow — do that intentionally, not by accident."
+            )
+        if "sustained_pad" in styles_in_section:
+            parts.append(
+                "  Sustained-pad instruments (strings, pad): hold "
+                "chord beds across the full section. One long-note "
+                "chord voicing per bar minimum; never leave the "
+                "harmony unsupported."
+            )
+        if "rhythmic_comp" in styles_in_section:
+            parts.append(
+                "  Rhythmic-comp instruments (piano, guitar): keep "
+                "the comping pattern (arpeggio / 8th-note chord cell) "
+                "going CONTINUOUSLY. Silence a bar only if the "
+                "arrangement explicitly calls for it."
+            )
+        if "plucked_discrete" in styles_in_section:
+            parts.append(
+                "  Plucked-discrete instruments (guzheng, pipa, "
+                "yangqin, harp): plucks are discrete but phrases "
+                "must be GROUPED as runs / arpeggios / tremolo — "
+                "NOT single plucks per bar."
+            )
 
     if ornament_vocabulary:
         parts.append("")

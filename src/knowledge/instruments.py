@@ -1247,6 +1247,23 @@ def format_for_composer(
         f"Intervals to avoid: {avoid_str}",
     ]
 
+    # Continuity rules are shown to BOTH featured and supporting
+    # instruments — in fact they matter MORE for supporting tracks,
+    # because that's where the "note-by-note" failure shows up.
+    continuity = card.get("continuity_profile") or {}
+    if continuity:
+        style = continuity.get("style", "rhythmic_comp")
+        cov = continuity.get("min_section_coverage_pct", 60)
+        max_gap = continuity.get("max_gap_beats", 2.0)
+        hint = continuity.get("phrase_grouping_hint", "")
+        lines.append(
+            f"Continuity: style={style}, "
+            f"cover >= {cov}% of the section in playing beats, "
+            f"no gap longer than {max_gap} beats between your notes."
+        )
+        if hint:
+            lines.append(f"Continuity hint: {hint}")
+
     if is_featured:
         lines.append(f"Techniques: {card['techniques']}")
         lines.append(f"Playing guide: {role_text}")
@@ -1376,6 +1393,23 @@ def get_ornament_vocabulary(instrument_name: str) -> list[str]:
     return list(card.get("ornament_vocabulary") or [])
 
 
+def get_continuity_profile(instrument_name: str) -> dict:
+    """Return the continuity_profile dict for an instrument, or {}.
+
+    The profile carries the keys:
+        style: one of continuous_breath / continuous_bowed /
+               sustained_pad / rhythmic_comp / plucked_discrete /
+               percussive.
+        min_section_coverage_pct: 0-100, minimum % of beats active.
+        max_gap_beats: float, longest tolerated silence.
+        phrase_grouping_hint: natural-language hint for the Composer.
+    """
+    card = lookup_instrument(instrument_name)
+    if not card:
+        return {}
+    return dict(card.get("continuity_profile") or {})
+
+
 # ---------------------------------------------------------------------------
 # Validation & extension merge
 # ---------------------------------------------------------------------------
@@ -1387,8 +1421,43 @@ _REQUIRED_EXT_FIELDS = (
     "spotlight_profile",
     "idiomatic_motifs",
     "velocity_envelope_preset",
+    "continuity_profile",
 )
 
+# continuity_profile semantics
+# ---------------------------------------------------------------------------
+# "style": one of
+#     "continuous_breath"  — wind instruments that must breathe through a
+#                             line. Dizi, Xiao, Flute, Clarinet, Trumpet.
+#                             Leaving single-beat notes with long gaps
+#                             sounds mechanical.
+#     "continuous_bowed"   — bowed strings. Erhu, Violin, Viola, Cello,
+#                             Contrabass. Same rule as breath — lines
+#                             should span phrases.
+#     "sustained_pad"      — evolving pad/texture. Strings (section), Pad.
+#                             Must hold chords across many beats.
+#     "rhythmic_comp"      — chord comping instruments that repeat a
+#                             rhythmic cell. Piano, Acoustic Guitar.
+#                             "Continuous" means the pattern repeats
+#                             through the section — not that every beat
+#                             has a note, but there must be no silent bar.
+#     "plucked_discrete"   — plucked strings that naturally produce
+#                             discrete attacks. Guzheng, Pipa, Yangqin,
+#                             Harp. Fine to have rests, but phrases must
+#                             be GROUPED (runs / arpeggios) not single
+#                             beats.
+#     "percussive"         — drums / percussion (not currently used).
+#
+# "min_section_coverage_pct": when active in a section, the ACTUAL playing
+#     beats (note durations summed) should cover at least this percent of
+#     the section's beats. 0-100.
+#
+# "max_gap_beats": the longest allowed silence between consecutive notes
+#     from this instrument when it is active. Violations mean the part
+#     sounds note-by-note.
+#
+# "phrase_grouping_hint": natural language guidance the Composer reads.
+# ---------------------------------------------------------------------------
 _DEFAULT_EXTENSIONS: dict = {
     "performance_recipes": {
         "default_vibrato": None,
@@ -1411,6 +1480,15 @@ _DEFAULT_EXTENSIONS: dict = {
     "idiomatic_motifs": [],
     "velocity_envelope_preset": {
         "attack": 0.1, "peak_ratio": 1.0, "decay": 0.2,
+    },
+    "continuity_profile": {
+        "style": "rhythmic_comp",
+        "min_section_coverage_pct": 60,
+        "max_gap_beats": 2.0,
+        "phrase_grouping_hint": (
+            "Group notes into phrases of 2-4 bars rather than "
+            "emitting single beats."
+        ),
     },
 }
 
@@ -1525,6 +1603,18 @@ INSTRUMENT_EXTENSIONS: dict[str, dict] = {
         "velocity_envelope_preset": {
             "attack": 0.15, "peak_ratio": 1.05, "decay": 0.25,
         },
+        "continuity_profile": {
+            "style": "continuous_bowed",
+            "min_section_coverage_pct": 75,
+            "max_gap_beats": 1.0,
+            "phrase_grouping_hint": (
+                "Erhu bows a phrase as one breath. When active in a "
+                "section, shape ONE continuous melodic line per 2-4 "
+                "bars with legato/slides between notes — no gaps "
+                "longer than a quarter note unless it's the phrase "
+                "breath."
+            ),
+        },
     },
 
     "dizi": {
@@ -1595,6 +1685,18 @@ INSTRUMENT_EXTENSIONS: dict[str, dict] = {
         "velocity_envelope_preset": {
             "attack": 0.2, "peak_ratio": 1.1, "decay": 0.3,
         },
+        "continuity_profile": {
+            "style": "continuous_breath",
+            "min_section_coverage_pct": 75,
+            "max_gap_beats": 1.0,
+            "phrase_grouping_hint": (
+                "Dizi is a breath instrument. When active in a section, "
+                "shape ONE continuous breath line that connects through "
+                "legato / slides / breath_swell — no isolated single-beat "
+                "notes with bar-long gaps. A rest must feel like a "
+                "deliberate breath, not a silence."
+            ),
+        },
     },
 
     "guzheng": {
@@ -1648,6 +1750,18 @@ INSTRUMENT_EXTENSIONS: dict[str, dict] = {
         "velocity_envelope_preset": {
             "attack": 0.02, "peak_ratio": 1.0, "decay": 0.5,
         },
+        "continuity_profile": {
+            "style": "plucked_discrete",
+            "min_section_coverage_pct": 55,
+            "max_gap_beats": 2.0,
+            "phrase_grouping_hint": (
+                "Guzheng is plucked — rests are natural. BUT phrases "
+                "must be GROUPED as sweeping runs, broken chords, or "
+                "tremolo, not one pluck per bar. A featured chorus "
+                "guzheng should pour a cascading pentatonic run, not "
+                "punctuate single notes."
+            ),
+        },
     },
 
     "piano": {
@@ -1694,6 +1808,18 @@ INSTRUMENT_EXTENSIONS: dict[str, dict] = {
         ],
         "velocity_envelope_preset": {
             "attack": 0.01, "peak_ratio": 1.0, "decay": 0.4,
+        },
+        "continuity_profile": {
+            "style": "rhythmic_comp",
+            "min_section_coverage_pct": 85,
+            "max_gap_beats": 0.75,
+            "phrase_grouping_hint": (
+                "Piano keeps a rhythmic comping pattern (arpeggios or "
+                "8th-note chord voicings) going CONTINUOUSLY through "
+                "the section. Even during a featured solo on another "
+                "instrument, piano maintains its comp. No bar of total "
+                "silence unless the section explicitly calls for it."
+            ),
         },
     },
 
@@ -1747,6 +1873,18 @@ INSTRUMENT_EXTENSIONS: dict[str, dict] = {
         "velocity_envelope_preset": {
             "attack": 0.12, "peak_ratio": 1.0, "decay": 0.25,
         },
+        "continuity_profile": {
+            "style": "continuous_bowed",
+            "min_section_coverage_pct": 80,
+            "max_gap_beats": 1.0,
+            "phrase_grouping_hint": (
+                "Cello bass line is continuous — walk the roots with "
+                "passing tones and legato transitions. When supporting, "
+                "sustain long tones with vibrato; when grooving, keep a "
+                "steady root-fifth pulse. Avoid quarter-note-and-silence "
+                "patterns."
+            ),
+        },
     },
 
     "strings": {
@@ -1796,6 +1934,17 @@ INSTRUMENT_EXTENSIONS: dict[str, dict] = {
         "velocity_envelope_preset": {
             "attack": 0.3, "peak_ratio": 1.0, "decay": 0.35,
         },
+        "continuity_profile": {
+            "style": "sustained_pad",
+            "min_section_coverage_pct": 95,
+            "max_gap_beats": 0.5,
+            "phrase_grouping_hint": (
+                "Strings pad HOLDS chord beds across the full section. "
+                "Voice the chord as long whole-notes / double-whole-notes "
+                "with light swells at section boundaries. Never emit "
+                "staccato pulses; never leave the harmony unsupported."
+            ),
+        },
     },
 
     # --- Remaining instruments: minimum-viable extensions ---
@@ -1828,6 +1977,15 @@ INSTRUMENT_EXTENSIONS: dict[str, dict] = {
         },
         "velocity_envelope_preset": {
             "attack": 0.02, "peak_ratio": 1.0, "decay": 0.45,
+        },
+        "continuity_profile": {
+            "style": "plucked_discrete",
+            "min_section_coverage_pct": 55,
+            "max_gap_beats": 2.0,
+            "phrase_grouping_hint": (
+                "Pipa is plucked. Group phrases as 轮指 tremolo sustains "
+                "or rapid melodic runs, not single-beat punctuations."
+            ),
         },
     },
 
@@ -1864,6 +2022,16 @@ INSTRUMENT_EXTENSIONS: dict[str, dict] = {
         "velocity_envelope_preset": {
             "attack": 0.3, "peak_ratio": 0.95, "decay": 0.4,
         },
+        "continuity_profile": {
+            "style": "continuous_breath",
+            "min_section_coverage_pct": 70,
+            "max_gap_beats": 1.5,
+            "phrase_grouping_hint": (
+                "Xiao is a breath instrument — softer than dizi, "
+                "breathier, more plaintive. Shape long breath-lines; "
+                "use breath_swell into, breath_fade out of each phrase."
+            ),
+        },
     },
 
     "yangqin": {
@@ -1877,6 +2045,16 @@ INSTRUMENT_EXTENSIONS: dict[str, dict] = {
             "avoid": [],
             "pairs_with": ["erhu", "dizi"],
             "competes_with": ["guzheng", "piano", "harp"],
+        },
+        "continuity_profile": {
+            "style": "plucked_discrete",
+            "min_section_coverage_pct": 70,
+            "max_gap_beats": 1.5,
+            "phrase_grouping_hint": (
+                "Yangqin (dulcimer) produces crisp plucks but is a "
+                "comping instrument — keep a continuous 8th / 16th "
+                "filigree pattern, not single hits per bar."
+            ),
         },
     },
 
@@ -1908,6 +2086,16 @@ INSTRUMENT_EXTENSIONS: dict[str, dict] = {
             "pairs_with": ["cello", "piano"],
             "competes_with": ["erhu", "viola"],
         },
+        "continuity_profile": {
+            "style": "continuous_bowed",
+            "min_section_coverage_pct": 75,
+            "max_gap_beats": 1.0,
+            "phrase_grouping_hint": (
+                "Violin bows long lyrical lines with vibrato and legato; "
+                "when supporting, sustain counter-melodies; never leave "
+                "isolated quarter-notes with bar-long gaps."
+            ),
+        },
     },
 
     "flute": {
@@ -1938,6 +2126,16 @@ INSTRUMENT_EXTENSIONS: dict[str, dict] = {
             "pairs_with": ["strings", "piano"],
             "competes_with": ["dizi", "xiao"],
         },
+        "continuity_profile": {
+            "style": "continuous_breath",
+            "min_section_coverage_pct": 75,
+            "max_gap_beats": 1.0,
+            "phrase_grouping_hint": (
+                "Flute is a breath instrument — phrase it in long "
+                "legato arcs with breath_swell on entrances. Avoid "
+                "choppy staccato quarter-notes when the role is lyrical."
+            ),
+        },
     },
 
     "trumpet": {
@@ -1951,6 +2149,17 @@ INSTRUMENT_EXTENSIONS: dict[str, dict] = {
             "avoid": ["intro"],
             "pairs_with": ["piano", "drums"],
             "competes_with": [],
+        },
+        "continuity_profile": {
+            "style": "continuous_breath",
+            "min_section_coverage_pct": 65,
+            "max_gap_beats": 1.5,
+            "phrase_grouping_hint": (
+                "Trumpet phrases are brassy and declarative but still "
+                "breath-driven. Group notes into punchy but connected "
+                "phrases — no single-note-per-bar riffs unless "
+                "intentional rhythmic stabs."
+            ),
         },
     },
 
@@ -1978,6 +2187,15 @@ INSTRUMENT_EXTENSIONS: dict[str, dict] = {
             "pairs_with": ["piano", "strings"],
             "competes_with": ["flute"],
         },
+        "continuity_profile": {
+            "style": "continuous_breath",
+            "min_section_coverage_pct": 70,
+            "max_gap_beats": 1.5,
+            "phrase_grouping_hint": (
+                "Clarinet speaks in long flowing counter-melodies; "
+                "breathe between 2-4 bar phrases. No fragmented stabs."
+            ),
+        },
     },
 
     "harp": {
@@ -1992,6 +2210,15 @@ INSTRUMENT_EXTENSIONS: dict[str, dict] = {
             "pairs_with": ["strings", "pad"],
             "competes_with": ["guzheng", "yangqin"],
         },
+        "continuity_profile": {
+            "style": "plucked_discrete",
+            "min_section_coverage_pct": 55,
+            "max_gap_beats": 2.0,
+            "phrase_grouping_hint": (
+                "Harp phrases are sweeping arpeggios or rolled chords, "
+                "not isolated plucks. Group into cascading figures."
+            ),
+        },
     },
 
     "contrabass": {
@@ -2004,6 +2231,16 @@ INSTRUMENT_EXTENSIONS: dict[str, dict] = {
             "avoid": [],
             "pairs_with": ["piano", "drums"],
             "competes_with": ["cello"],
+        },
+        "continuity_profile": {
+            "style": "continuous_bowed",
+            "min_section_coverage_pct": 80,
+            "max_gap_beats": 1.0,
+            "phrase_grouping_hint": (
+                "Contrabass anchors the harmony with sustained roots "
+                "or walking lines. Keep the bottom of the mix present "
+                "— avoid whole-bar gaps."
+            ),
         },
     },
 
@@ -2033,6 +2270,15 @@ INSTRUMENT_EXTENSIONS: dict[str, dict] = {
             "avoid": [],
             "pairs_with": ["cello", "violin"],
             "competes_with": ["strings"],
+        },
+        "continuity_profile": {
+            "style": "continuous_bowed",
+            "min_section_coverage_pct": 75,
+            "max_gap_beats": 1.0,
+            "phrase_grouping_hint": (
+                "Viola bows inner voice counter-melodies or sustained "
+                "pads — keep the inner texture continuous, no gaps."
+            ),
         },
     },
 }

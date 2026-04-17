@@ -39,6 +39,7 @@ from src.knowledge.instruments import (
     format_for_composer,
     format_for_instrumentalist,
     format_for_critic,
+    get_continuity_profile,
     get_ornament_vocabulary,
 )
 from src.knowledge.spotlight_presets import (
@@ -1193,6 +1194,20 @@ class MusicGenerationPipeline:
                         featured_instruments,
                     )
 
+                    # Build continuity_profiles map for the active
+                    # instruments — this is what teaches SUPPORTING
+                    # tracks (piano, strings, cello) not to drop to
+                    # a single note per bar when Dizi/Erhu take the
+                    # spotlight.
+                    continuity_profiles: dict[str, dict] = {}
+                    for inst in blueprint_instruments:
+                        iname = inst.get("name", "")
+                        if iname.lower() not in active_lower:
+                            continue
+                        prof = get_continuity_profile(iname)
+                        if prof:
+                            continuity_profiles[iname] = prof
+
                     section_prompt = build_composer_section_prompt(
                         section_name=sec["name"],
                         start_beat=sec["start_beat"],
@@ -1213,6 +1228,7 @@ class MusicGenerationPipeline:
                         active_instruments=active_instruments,
                         featured_instruments=featured_instruments,
                         ornament_vocabulary=ornament_vocab,
+                        continuity_profiles=continuity_profiles,
                     )
 
                     comp_resp = await self._call_agent(
