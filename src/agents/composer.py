@@ -13,27 +13,13 @@ from autogen_agentchat.messages import BaseChatMessage, TextMessage
 from autogen_core import CancellationToken
 from loguru import logger
 
-from src.llm.prompts import COMPOSER_SYSTEM, COMPOSER_LEAD_SHEET_SYSTEM
-
-_COMPOSER_MODE_PROMPTS = {
-    "section": COMPOSER_SYSTEM,
-    "lead_sheet": COMPOSER_LEAD_SHEET_SYSTEM,
-    "instrument": COMPOSER_SYSTEM,
-}
+from src.llm.prompts import COMPOSER_SYSTEM
 
 
 class ComposerAgent(BaseChatAgent):
     def __init__(self, name: str, model_client, description: str = "Designs harmony, melody, and edits notes in the score"):
         super().__init__(name=name, description=description)
         self._model_client = model_client
-        self._mode = "section"
-
-    def set_mode(self, mode: str) -> None:
-        """Set composer mode: 'section', 'lead_sheet', or 'instrument'."""
-        if mode not in _COMPOSER_MODE_PROMPTS:
-            raise ValueError(f"Unknown composer mode: {mode}. Valid: {list(_COMPOSER_MODE_PROMPTS)}")
-        self._mode = mode
-        logger.info(f"[Composer] mode set to '{mode}'")
 
     @property
     def produced_message_types(self) -> Sequence[type[BaseChatMessage]]:
@@ -46,7 +32,7 @@ class ComposerAgent(BaseChatAgent):
 
         from autogen_core.models import SystemMessage, UserMessage
         llm_messages = [
-            SystemMessage(content=_COMPOSER_MODE_PROMPTS.get(self._mode, COMPOSER_SYSTEM)),
+            SystemMessage(content=COMPOSER_SYSTEM),
             UserMessage(
                 content=f"Here is the conversation so far. Write concrete notes as JSON edits:\n\n{context}",
                 source=self.name,

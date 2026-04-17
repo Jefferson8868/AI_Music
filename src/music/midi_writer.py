@@ -225,7 +225,10 @@ def score_to_midi(score, ticks_per_beat: int = 480) -> mido.MidiFile:
             channel=ch, time=0,
         ))
 
-        events: list[tuple[int, mido.Message]] = []
+        events: list[tuple[int, int, mido.Message]] = []
+        # Secondary sort key: 0 for pitch-bend/CC (before notes at same tick),
+        # 1 for note_on, 2 for note_off. Keeps bends applied BEFORE the note
+        # they prepare, and CC envelopes taking effect immediately.
         for n in trk.notes:
             dur = n.duration_beats
             if n.articulation == "staccato":
@@ -233,12 +236,37 @@ def score_to_midi(score, ticks_per_beat: int = 480) -> mido.MidiFile:
             s = _beats_to_ticks(n.start_beat, ticks_per_beat)
             e = s + _beats_to_ticks(dur, ticks_per_beat)
             vel = min(127, max(1, n.velocity))
-            events.append((s, mido.Message(
+            events.append((s, 1, mido.Message(
                 "note_on", note=n.pitch, velocity=vel, channel=ch,
             )))
-            events.append((e, mido.Message(
+            events.append((e, 2, mido.Message(
                 "note_off", note=n.pitch, velocity=0, channel=ch,
             )))
+
+        # ----- Performance-render events (Phase 4 output) -----
+        for pb in getattr(trk, "pitch_bends", []) or []:
+            try:
+                t = _beats_to_ticks(float(pb.beat), ticks_per_beat)
+                val = min(8191, max(-8192, int(pb.value)))
+                pb_ch = int(pb.channel) if pb.channel is not None else ch
+                events.append((t, 0, mido.Message(
+                    "pitchwheel", pitch=val, channel=pb_ch,
+                )))
+            except (TypeError, ValueError):
+                continue
+
+        for cc in getattr(trk, "cc_events", []) or []:
+            try:
+                t = _beats_to_ticks(float(cc.beat), ticks_per_beat)
+                controller = min(127, max(0, int(cc.controller)))
+                val = min(127, max(0, int(cc.value)))
+                cc_ch = int(cc.channel) if cc.channel is not None else ch
+                events.append((t, 0, mido.Message(
+                    "control_change", control=controller,
+                    value=val, channel=cc_ch,
+                )))
+            except (TypeError, ValueError):
+                continue
 
         trk_arts = articulations.get(trk.instrument, [])
         for art in trk_arts:
@@ -257,11 +285,11 @@ def score_to_midi(score, ticks_per_beat: int = 480) -> mido.MidiFile:
                 intensity = int(
                     min(127, max(0, art.get("intensity", 0.5) * 127))
                 )
-                events.append((t_start, mido.Message(
+                events.append((t_start, 0, mido.Message(
                     "control_change", control=1, value=intensity,
                     channel=ch,
                 )))
-                events.append((t_end, mido.Message(
+                events.append((t_end, 0, mido.Message(
                     "control_change", control=1, value=0,
                     channel=ch,
                 )))
@@ -270,10 +298,10 @@ def score_to_midi(score, ticks_per_beat: int = 480) -> mido.MidiFile:
                 bend_val = min(8191, max(-8192, int(
                     semitones * 4096 / 2
                 )))
-                events.append((t_start, mido.Message(
+                events.append((t_start, 0, mido.Message(
                     "pitchwheel", pitch=bend_val, channel=ch,
                 )))
-                events.append((t_end, mido.Message(
+                events.append((t_end, 0, mido.Message(
                     "pitchwheel", pitch=0, channel=ch,
                 )))
             elif art_type == "glissando":
@@ -283,28 +311,28 @@ def score_to_midi(score, ticks_per_beat: int = 480) -> mido.MidiFile:
                 for i in range(steps):
                     t = t_start + (dur_ticks * i // steps)
                     bend = int(direction * 8191 * (i / steps))
-                    events.append((t, mido.Message(
+                    events.append((t, 0, mido.Message(
                         "pitchwheel", pitch=bend, channel=ch,
                     )))
-                events.append((t_end, mido.Message(
+                events.append((t_end, 0, mido.Message(
                     "pitchwheel", pitch=0, channel=ch,
                 )))
             elif art_type == "tremolo":
                 expr_val = int(
                     min(127, max(0, art.get("intensity", 0.7) * 127))
                 )
-                events.append((t_start, mido.Message(
+                events.append((t_start, 0, mido.Message(
                     "control_change", control=11, value=expr_val,
                     channel=ch,
                 )))
-                events.append((t_end, mido.Message(
+                events.append((t_end, 0, mido.Message(
                     "control_change", control=11, value=127,
                     channel=ch,
                 )))
 
-        events.sort(key=lambda x: x[0])
+        events.sort(key=lambda x: (x[0], x[1]))
         prev = 0
-        for tick, msg in events:
+        for tick, _kind, msg in events:
             msg.time = max(0, tick - prev)
             midi_track.append(msg)
             prev = tick

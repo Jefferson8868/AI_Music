@@ -1198,9 +1198,18 @@ def lookup_instrument(name: str) -> dict | None:
 
 
 def format_for_composer(
-    instrument_name: str, role: str,
+    instrument_name: str,
+    role: str,
+    section: str | None = None,
+    is_featured: bool = False,
 ) -> str | None:
-    """Format a knowledge card as Composer prompt text."""
+    """Format a knowledge card as Composer prompt text.
+
+    If is_featured, returns full techniques/style/role_guidance plus the
+    ornament vocabulary and up to 2 idiomatic motifs.
+    If not featured, returns a compact summary to save tokens for supporting
+    instruments.
+    """
     card = lookup_instrument(instrument_name)
     if not card:
         return None
@@ -1226,41 +1235,808 @@ def format_for_composer(
         else "none"
     )
 
+    vocab = card.get("ornament_vocabulary") or []
+    motifs = card.get("idiomatic_motifs") or []
+    spot_role = "FEATURED" if is_featured else "SUPPORTING"
+    section_tag = f" in [{section.upper()}]" if section else ""
+
     lines = [
-        f"--- {card['name']} ({role}) ---",
+        f"--- {card['name']} ({role}) [{spot_role}]{section_tag} ---",
         f"Sweet spot: MIDI {card['sweet_spot'][0]}-{card['sweet_spot'][1]}",
         f"Idiomatic intervals (semitones): {intervals_str}",
         f"Intervals to avoid: {avoid_str}",
-        f"Techniques: {card['techniques'][:200]}",
-        f"Playing guide: {role_text}",
-        f"Style: {card['style_notes'][:200]}",
-        "",
-        f"Example ({example['description']}) — "
-        "use as INSPIRATION, create your own phrases:",
-        f"  [{notes_str}]",
     ]
+
+    if is_featured:
+        lines.append(f"Techniques: {card['techniques']}")
+        lines.append(f"Playing guide: {role_text}")
+        lines.append(f"Style: {card['style_notes']}")
+        if vocab:
+            lines.append(
+                "Available ornaments: " + ", ".join(vocab)
+            )
+        for motif in motifs[:2]:
+            motif_notes = ", ".join(
+                f'{{"pitch": {n["pitch"]}, '
+                f'"start_beat": {n["start_beat"]}, '
+                f'"duration_beats": {n["duration_beats"]}, '
+                f'"velocity": {n["velocity"]}, '
+                f'"ornaments": {n.get("ornaments", [])}}}'
+                for n in motif["notes"][:8]
+            )
+            lines.append(
+                f"Motif '{motif['name']}' ({motif['description']}): "
+                f"[{motif_notes}]"
+            )
+    else:
+        # Compact summary for supporting instruments
+        tech_summary = card["techniques"].split(".")[0][:160]
+        lines.append(f"Techniques (summary): {tech_summary}.")
+        lines.append(f"Playing guide: {role_text[:200]}")
+        if vocab:
+            lines.append(
+                "Available ornaments: " + ", ".join(vocab)
+            )
+
+    lines.append("")
+    lines.append(
+        f"Example ({example['description']}) — "
+        "use as INSPIRATION, create your own phrases:"
+    )
+    lines.append(f"  [{notes_str}]")
     return "\n".join(lines)
 
 
 def format_for_instrumentalist(
     instrument_name: str,
+    section: str | None = None,
 ) -> str | None:
-    """Format technique guidance for the Instrumentalist agent."""
+    """Format technique guidance + ornament vocabulary for the Instrumentalist."""
     card = lookup_instrument(instrument_name)
     if not card:
         return None
 
-    return (
-        f"{card['name']}: {card['techniques']}"
-    )
+    vocab = card.get("ornament_vocabulary") or []
+    recipes = card.get("performance_recipes") or {}
+    lines = [f"{card['name']}:"]
+    lines.append(f"  Techniques: {card['techniques']}")
+    if vocab:
+        lines.append("  Ornament vocabulary: " + ", ".join(vocab))
+    if recipes:
+        default_vib = recipes.get("default_vibrato")
+        if default_vib:
+            lines.append(
+                f"  Default vibrato: {default_vib.get('type')} "
+                f"(depth={default_vib.get('depth')}, "
+                f"rate={default_vib.get('rate_hz')}Hz)"
+            )
+        vc = recipes.get("velocity_curve")
+        if vc:
+            lines.append(f"  Velocity curve: {vc}")
+    return "\n".join(lines)
 
 
 def format_for_critic(
     instrument_name: str,
 ) -> str | None:
-    """Format evaluation criteria for the Critic agent."""
+    """Format evaluation criteria + spotlight profile for the Critic agent."""
     card = lookup_instrument(instrument_name)
     if not card:
         return None
 
-    return f"- {card['name']}: {card['critic_criteria']}"
+    lines = [f"- {card['name']}: {card['critic_criteria']}"]
+    profile = card.get("spotlight_profile")
+    if profile:
+        lines.append(
+            f"  Spotlight profile: typical_role={profile.get('typical_role')}, "
+            f"good_at={profile.get('good_at', [])}, "
+            f"avoid={profile.get('avoid', [])}, "
+            f"pairs_with={profile.get('pairs_with', [])}, "
+            f"competes_with={profile.get('competes_with', [])}"
+        )
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Accessors for the performance renderer
+# ---------------------------------------------------------------------------
+
+def get_performance_recipe(
+    instrument_name: str, field_name: str, default=None,
+):
+    """Return a specific field from the card's performance_recipes, or default."""
+    card = lookup_instrument(instrument_name)
+    if not card:
+        return default
+    recipes = card.get("performance_recipes") or {}
+    return recipes.get(field_name, default)
+
+
+def get_auto_rules(instrument_name: str) -> list[dict]:
+    """Return the list of auto-ornament rules for an instrument."""
+    card = lookup_instrument(instrument_name)
+    if not card:
+        return []
+    return list(card.get("auto_rules") or [])
+
+
+def get_spotlight_profile(instrument_name: str) -> dict:
+    """Return the spotlight profile dict for an instrument, or {}."""
+    card = lookup_instrument(instrument_name)
+    if not card:
+        return {}
+    return dict(card.get("spotlight_profile") or {})
+
+
+def get_ornament_vocabulary(instrument_name: str) -> list[str]:
+    """Return the list of ornament names this instrument supports."""
+    card = lookup_instrument(instrument_name)
+    if not card:
+        return []
+    return list(card.get("ornament_vocabulary") or [])
+
+
+# ---------------------------------------------------------------------------
+# Validation & extension merge
+# ---------------------------------------------------------------------------
+
+_REQUIRED_EXT_FIELDS = (
+    "performance_recipes",
+    "auto_rules",
+    "ornament_vocabulary",
+    "spotlight_profile",
+    "idiomatic_motifs",
+    "velocity_envelope_preset",
+)
+
+_DEFAULT_EXTENSIONS: dict = {
+    "performance_recipes": {
+        "default_vibrato": None,
+        "long_note_threshold_beats": 2.0,
+        "long_note_ornaments": [],
+        "consecutive_step_threshold_beats": 0.5,
+        "consecutive_step_ornaments": [],
+        "phrase_end_ornaments": [],
+        "velocity_curve": "flat",
+    },
+    "auto_rules": [],
+    "ornament_vocabulary": ["staccato", "tenuto", "legato_to_next"],
+    "spotlight_profile": {
+        "typical_role": "accompaniment",
+        "good_at": [],
+        "avoid": [],
+        "pairs_with": [],
+        "competes_with": [],
+    },
+    "idiomatic_motifs": [],
+    "velocity_envelope_preset": {
+        "attack": 0.1, "peak_ratio": 1.0, "decay": 0.2,
+    },
+}
+
+
+def _validate_card(name: str, card: dict) -> None:
+    """Assert card has all new extension fields (after merge). Fail fast."""
+    for field in _REQUIRED_EXT_FIELDS:
+        if field not in card:
+            raise ValueError(
+                f"INSTRUMENT_CARDS['{name}'] missing required field '{field}' "
+                f"after extension merge. Check INSTRUMENT_EXTENSIONS."
+            )
+    vocab = card.get("ornament_vocabulary") or []
+    if not isinstance(vocab, list):
+        raise ValueError(
+            f"INSTRUMENT_CARDS['{name}'].ornament_vocabulary must be a list"
+        )
+
+
+def _merge_extensions() -> None:
+    """Inject INSTRUMENT_EXTENSIONS into INSTRUMENT_CARDS + fill defaults."""
+    ext_table = globals().get("INSTRUMENT_EXTENSIONS", {})
+    for inst_name, card in INSTRUMENT_CARDS.items():
+        ext = ext_table.get(inst_name, {})
+        for field, default in _DEFAULT_EXTENSIONS.items():
+            if field in ext:
+                card[field] = ext[field]
+            elif field not in card:
+                # Deep-copy defaults to avoid shared mutable state
+                if isinstance(default, dict):
+                    card[field] = dict(default)
+                elif isinstance(default, list):
+                    card[field] = list(default)
+                else:
+                    card[field] = default
+        _validate_card(inst_name, card)
+
+
+# ---------------------------------------------------------------------------
+# Extension data for each instrument. Rich entries for Erhu / Dizi / Guzheng /
+# Piano / Cello / Strings (the user's fusion test piece). Remaining
+# instruments fall back to _DEFAULT_EXTENSIONS unless overridden here.
+# ---------------------------------------------------------------------------
+
+INSTRUMENT_EXTENSIONS: dict[str, dict] = {
+    "erhu": {
+        "performance_recipes": {
+            "default_vibrato": {
+                "type": "vibrato_deep", "depth": 60, "rate_hz": 6.0,
+            },
+            "long_note_threshold_beats": 1.5,
+            "long_note_ornaments": ["vibrato_deep"],
+            "consecutive_step_threshold_beats": 0.5,
+            "consecutive_step_ornaments": [
+                "legato_to_next", "slide_up_from:1",
+            ],
+            "phrase_end_ornaments": ["vibrato_deep"],
+            "velocity_curve": "swell",
+        },
+        "auto_rules": [
+            {"condition": "duration > 1.5",
+             "add_ornaments": ["vibrato_deep"]},
+            {"condition": "next_note_close",
+             "add_ornaments": ["legato_to_next"]},
+            {"condition": "ascending_step",
+             "add_ornaments": ["slide_up_from:1"]},
+            {"condition": "descending_step",
+             "add_ornaments": ["slide_down_from:1"]},
+        ],
+        "ornament_vocabulary": [
+            "vibrato_light", "vibrato_deep", "vibrato_delayed",
+            "slide_up_from", "slide_down_from",
+            "slide_up_to", "slide_down_to",
+            "bend_dip", "legato_to_next", "tenuto",
+        ],
+        "spotlight_profile": {
+            "typical_role": "lead",
+            "good_at": ["chorus", "bridge", "pre_chorus"],
+            "avoid": ["intro"],
+            "pairs_with": ["dizi", "pipa"],
+            "competes_with": ["violin", "viola"],
+        },
+        "idiomatic_motifs": [
+            {
+                "name": "erhu_lyrical_ascent",
+                "description": "Rising emotional phrase with portamento",
+                "notes": [
+                    {"pitch": 62, "start_beat": 0.0,
+                     "duration_beats": 1.0, "velocity": 70,
+                     "ornaments": ["slide_up_from:2"]},
+                    {"pitch": 64, "start_beat": 1.0,
+                     "duration_beats": 0.5, "velocity": 75,
+                     "ornaments": ["legato_to_next"]},
+                    {"pitch": 67, "start_beat": 1.5,
+                     "duration_beats": 2.0, "velocity": 85,
+                     "ornaments": ["vibrato_deep"]},
+                ],
+            },
+            {
+                "name": "erhu_vocal_sigh",
+                "description": "Vocal-like sigh with dip",
+                "notes": [
+                    {"pitch": 69, "start_beat": 0.0,
+                     "duration_beats": 2.0, "velocity": 80,
+                     "ornaments": ["vibrato_delayed", "bend_dip"]},
+                    {"pitch": 67, "start_beat": 2.0,
+                     "duration_beats": 1.5, "velocity": 70,
+                     "ornaments": ["slide_down_from:2"]},
+                ],
+            },
+        ],
+        "velocity_envelope_preset": {
+            "attack": 0.15, "peak_ratio": 1.05, "decay": 0.25,
+        },
+    },
+
+    "dizi": {
+        "performance_recipes": {
+            "default_vibrato": {
+                "type": "vibrato_light", "depth": 30, "rate_hz": 5.5,
+            },
+            "long_note_threshold_beats": 1.5,
+            "long_note_ornaments": ["breath_swell", "vibrato_light"],
+            "consecutive_step_threshold_beats": 0.5,
+            "consecutive_step_ornaments": ["legato_to_next"],
+            "phrase_end_ornaments": ["breath_fade"],
+            "velocity_curve": "swell",
+        },
+        "auto_rules": [
+            {"condition": "duration > 1.5",
+             "add_ornaments": ["breath_swell", "vibrato_light"]},
+            {"condition": "first_of_phrase",
+             "add_ornaments": ["breath_swell"]},
+            {"condition": "last_of_phrase",
+             "add_ornaments": ["breath_fade"]},
+            {"condition": "short_high_note",
+             "add_ornaments": ["grace_note_above"]},
+        ],
+        "ornament_vocabulary": [
+            "breath_swell", "breath_fade", "flutter", "overblow",
+            "vibrato_light", "vibrato_deep", "vibrato_delayed",
+            "slide_up_to", "slide_down_to",
+            "grace_note_above", "grace_note_below",
+            "staccato", "tenuto", "legato_to_next",
+        ],
+        "spotlight_profile": {
+            "typical_role": "lead",
+            "good_at": ["chorus", "pre_chorus", "outro"],
+            "avoid": ["intro", "verse"],
+            "pairs_with": ["erhu", "pipa", "guzheng"],
+            "competes_with": ["flute", "xiao"],
+        },
+        "idiomatic_motifs": [
+            {
+                "name": "dizi_bright_hook",
+                "description": "Bright climactic hook with flutter",
+                "notes": [
+                    {"pitch": 79, "start_beat": 0.0,
+                     "duration_beats": 0.5, "velocity": 90,
+                     "ornaments": ["grace_note_above"]},
+                    {"pitch": 81, "start_beat": 0.5,
+                     "duration_beats": 0.5, "velocity": 92,
+                     "ornaments": []},
+                    {"pitch": 84, "start_beat": 1.0,
+                     "duration_beats": 2.0, "velocity": 100,
+                     "ornaments": ["breath_swell", "flutter"]},
+                ],
+            },
+            {
+                "name": "dizi_breath_entrance",
+                "description": "Slow breath-swell entry typical of 国风",
+                "notes": [
+                    {"pitch": 74, "start_beat": 0.0,
+                     "duration_beats": 3.0, "velocity": 65,
+                     "ornaments": ["breath_swell", "vibrato_light"]},
+                    {"pitch": 76, "start_beat": 3.0,
+                     "duration_beats": 1.0, "velocity": 70,
+                     "ornaments": ["breath_fade"]},
+                ],
+            },
+        ],
+        "velocity_envelope_preset": {
+            "attack": 0.2, "peak_ratio": 1.1, "decay": 0.3,
+        },
+    },
+
+    "guzheng": {
+        "performance_recipes": {
+            "default_vibrato": None,
+            "long_note_threshold_beats": 2.0,
+            "long_note_ornaments": ["tremolo_rapid"],
+            "consecutive_step_threshold_beats": 0.5,
+            "consecutive_step_ornaments": [],
+            "phrase_end_ornaments": [],
+            "velocity_curve": "decay",
+        },
+        "auto_rules": [
+            {"condition": "duration > 2.0",
+             "add_ornaments": ["tremolo_rapid"]},
+            {"condition": "ascending_run",
+             "add_ornaments": ["glissando_from"]},
+            {"condition": "first_of_phrase",
+             "add_ornaments": ["glissando_from"]},
+        ],
+        "ornament_vocabulary": [
+            "tremolo_rapid", "glissando_from", "glissando_to",
+            "slide_up_from", "slide_down_from",
+            "grace_note_above", "grace_note_below",
+            "staccato", "tenuto",
+        ],
+        "spotlight_profile": {
+            "typical_role": "lead",
+            "good_at": ["verse", "chorus", "bridge"],
+            "avoid": [],
+            "pairs_with": ["dizi", "erhu"],
+            "competes_with": ["pipa", "harp", "yangqin"],
+        },
+        "idiomatic_motifs": [
+            {
+                "name": "guzheng_pentatonic_sweep",
+                "description": "Ascending pentatonic sweep with gliss",
+                "notes": [
+                    {"pitch": 67, "start_beat": 0.0,
+                     "duration_beats": 0.5, "velocity": 80,
+                     "ornaments": ["glissando_from"]},
+                    {"pitch": 69, "start_beat": 0.5,
+                     "duration_beats": 0.5, "velocity": 78,
+                     "ornaments": []},
+                    {"pitch": 72, "start_beat": 1.0,
+                     "duration_beats": 2.0, "velocity": 85,
+                     "ornaments": ["tremolo_rapid"]},
+                ],
+            },
+        ],
+        "velocity_envelope_preset": {
+            "attack": 0.02, "peak_ratio": 1.0, "decay": 0.5,
+        },
+    },
+
+    "piano": {
+        "performance_recipes": {
+            "default_vibrato": None,
+            "long_note_threshold_beats": 3.0,
+            "long_note_ornaments": [],
+            "consecutive_step_threshold_beats": 0.25,
+            "consecutive_step_ornaments": ["legato_to_next"],
+            "phrase_end_ornaments": [],
+            "velocity_curve": "decay",
+        },
+        "auto_rules": [
+            {"condition": "next_note_close",
+             "add_ornaments": ["legato_to_next"]},
+        ],
+        "ornament_vocabulary": [
+            "staccato", "tenuto", "legato_to_next",
+            "grace_note_above", "grace_note_below",
+        ],
+        "spotlight_profile": {
+            "typical_role": "chords",
+            "good_at": ["intro", "verse", "chorus", "bridge", "outro"],
+            "avoid": [],
+            "pairs_with": ["bass", "drums", "pad"],
+            "competes_with": ["yangqin", "harp"],
+        },
+        "idiomatic_motifs": [
+            {
+                "name": "piano_pop_comp",
+                "description": "Modern pop chord comping with voice leading",
+                "notes": [
+                    {"pitch": 60, "start_beat": 0.0,
+                     "duration_beats": 0.5, "velocity": 70,
+                     "ornaments": ["legato_to_next"]},
+                    {"pitch": 64, "start_beat": 0.0,
+                     "duration_beats": 0.5, "velocity": 65,
+                     "ornaments": []},
+                    {"pitch": 67, "start_beat": 0.0,
+                     "duration_beats": 0.5, "velocity": 60,
+                     "ornaments": []},
+                ],
+            },
+        ],
+        "velocity_envelope_preset": {
+            "attack": 0.01, "peak_ratio": 1.0, "decay": 0.4,
+        },
+    },
+
+    "cello": {
+        "performance_recipes": {
+            "default_vibrato": {
+                "type": "vibrato_light", "depth": 25, "rate_hz": 4.5,
+            },
+            "long_note_threshold_beats": 2.0,
+            "long_note_ornaments": ["vibrato_light"],
+            "consecutive_step_threshold_beats": 0.5,
+            "consecutive_step_ornaments": ["legato_to_next"],
+            "phrase_end_ornaments": ["vibrato_light"],
+            "velocity_curve": "swell",
+        },
+        "auto_rules": [
+            {"condition": "duration > 2.0",
+             "add_ornaments": ["vibrato_light"]},
+            {"condition": "next_note_close",
+             "add_ornaments": ["legato_to_next"]},
+        ],
+        "ornament_vocabulary": [
+            "vibrato_light", "vibrato_deep", "vibrato_delayed",
+            "slide_up_from", "slide_down_from",
+            "legato_to_next", "staccato", "tenuto",
+        ],
+        "spotlight_profile": {
+            "typical_role": "bass",
+            "good_at": ["verse", "chorus", "bridge", "outro"],
+            "avoid": [],
+            "pairs_with": ["piano", "pad", "strings"],
+            "competes_with": ["contrabass"],
+        },
+        "idiomatic_motifs": [
+            {
+                "name": "cello_bass_walk",
+                "description": "Walking bass line with smooth voice leading",
+                "notes": [
+                    {"pitch": 43, "start_beat": 0.0,
+                     "duration_beats": 1.0, "velocity": 75,
+                     "ornaments": ["legato_to_next"]},
+                    {"pitch": 45, "start_beat": 1.0,
+                     "duration_beats": 1.0, "velocity": 72,
+                     "ornaments": ["legato_to_next"]},
+                    {"pitch": 47, "start_beat": 2.0,
+                     "duration_beats": 2.0, "velocity": 78,
+                     "ornaments": ["vibrato_light"]},
+                ],
+            },
+        ],
+        "velocity_envelope_preset": {
+            "attack": 0.12, "peak_ratio": 1.0, "decay": 0.25,
+        },
+    },
+
+    "strings": {
+        "performance_recipes": {
+            "default_vibrato": {
+                "type": "vibrato_light", "depth": 20, "rate_hz": 5.0,
+            },
+            "long_note_threshold_beats": 2.0,
+            "long_note_ornaments": ["vibrato_light"],
+            "consecutive_step_threshold_beats": 1.0,
+            "consecutive_step_ornaments": ["legato_to_next"],
+            "phrase_end_ornaments": [],
+            "velocity_curve": "swell",
+        },
+        "auto_rules": [
+            {"condition": "duration > 2.0",
+             "add_ornaments": ["vibrato_light"]},
+        ],
+        "ornament_vocabulary": [
+            "vibrato_light", "vibrato_deep",
+            "legato_to_next", "tenuto",
+        ],
+        "spotlight_profile": {
+            "typical_role": "pad",
+            "good_at": ["chorus", "bridge", "outro"],
+            "avoid": [],
+            "pairs_with": ["piano", "pad", "cello"],
+            "competes_with": ["viola"],
+        },
+        "idiomatic_motifs": [
+            {
+                "name": "strings_pad_swell",
+                "description": "Sustained pad chord with swell",
+                "notes": [
+                    {"pitch": 60, "start_beat": 0.0,
+                     "duration_beats": 4.0, "velocity": 55,
+                     "ornaments": ["vibrato_light"]},
+                    {"pitch": 64, "start_beat": 0.0,
+                     "duration_beats": 4.0, "velocity": 52,
+                     "ornaments": []},
+                    {"pitch": 67, "start_beat": 0.0,
+                     "duration_beats": 4.0, "velocity": 50,
+                     "ornaments": []},
+                ],
+            },
+        ],
+        "velocity_envelope_preset": {
+            "attack": 0.3, "peak_ratio": 1.0, "decay": 0.35,
+        },
+    },
+
+    # --- Remaining instruments: minimum-viable extensions ---
+
+    "pipa": {
+        "performance_recipes": {
+            "default_vibrato": None,
+            "long_note_threshold_beats": 1.5,
+            "long_note_ornaments": ["tremolo_rapid"],
+            "consecutive_step_threshold_beats": 0.25,
+            "consecutive_step_ornaments": [],
+            "phrase_end_ornaments": [],
+            "velocity_curve": "decay",
+        },
+        "auto_rules": [
+            {"condition": "duration > 1.5",
+             "add_ornaments": ["tremolo_rapid"]},
+        ],
+        "ornament_vocabulary": [
+            "tremolo_rapid", "glissando_from",
+            "grace_note_above", "grace_note_below",
+            "staccato", "tenuto",
+        ],
+        "spotlight_profile": {
+            "typical_role": "lead",
+            "good_at": ["chorus", "bridge"],
+            "avoid": [],
+            "pairs_with": ["erhu", "dizi"],
+            "competes_with": ["guzheng", "yangqin"],
+        },
+        "velocity_envelope_preset": {
+            "attack": 0.02, "peak_ratio": 1.0, "decay": 0.45,
+        },
+    },
+
+    "xiao": {
+        "performance_recipes": {
+            "default_vibrato": {
+                "type": "vibrato_light", "depth": 15, "rate_hz": 4.5,
+            },
+            "long_note_threshold_beats": 1.5,
+            "long_note_ornaments": ["breath_swell", "vibrato_light"],
+            "consecutive_step_threshold_beats": 0.5,
+            "consecutive_step_ornaments": ["legato_to_next"],
+            "phrase_end_ornaments": ["breath_fade"],
+            "velocity_curve": "swell",
+        },
+        "auto_rules": [
+            {"condition": "first_of_phrase",
+             "add_ornaments": ["breath_swell"]},
+            {"condition": "last_of_phrase",
+             "add_ornaments": ["breath_fade"]},
+        ],
+        "ornament_vocabulary": [
+            "breath_swell", "breath_fade",
+            "vibrato_light", "vibrato_delayed",
+            "legato_to_next", "tenuto",
+        ],
+        "spotlight_profile": {
+            "typical_role": "texture",
+            "good_at": ["intro", "outro", "bridge"],
+            "avoid": ["chorus"],
+            "pairs_with": ["erhu", "guzheng"],
+            "competes_with": ["dizi", "flute"],
+        },
+        "velocity_envelope_preset": {
+            "attack": 0.3, "peak_ratio": 0.95, "decay": 0.4,
+        },
+    },
+
+    "yangqin": {
+        "ornament_vocabulary": [
+            "tremolo_rapid", "grace_note_above",
+            "staccato", "tenuto",
+        ],
+        "spotlight_profile": {
+            "typical_role": "accompaniment",
+            "good_at": ["verse", "chorus"],
+            "avoid": [],
+            "pairs_with": ["erhu", "dizi"],
+            "competes_with": ["guzheng", "piano", "harp"],
+        },
+    },
+
+    "violin": {
+        "performance_recipes": {
+            "default_vibrato": {
+                "type": "vibrato_light", "depth": 30, "rate_hz": 5.5,
+            },
+            "long_note_threshold_beats": 2.0,
+            "long_note_ornaments": ["vibrato_light"],
+            "consecutive_step_threshold_beats": 0.5,
+            "consecutive_step_ornaments": ["legato_to_next"],
+            "phrase_end_ornaments": [],
+            "velocity_curve": "swell",
+        },
+        "auto_rules": [
+            {"condition": "duration > 2.0",
+             "add_ornaments": ["vibrato_light"]},
+        ],
+        "ornament_vocabulary": [
+            "vibrato_light", "vibrato_deep",
+            "slide_up_from", "slide_down_from",
+            "legato_to_next", "staccato", "tenuto",
+        ],
+        "spotlight_profile": {
+            "typical_role": "lead",
+            "good_at": ["chorus", "bridge"],
+            "avoid": [],
+            "pairs_with": ["cello", "piano"],
+            "competes_with": ["erhu", "viola"],
+        },
+    },
+
+    "flute": {
+        "performance_recipes": {
+            "default_vibrato": {
+                "type": "vibrato_light", "depth": 25, "rate_hz": 5.0,
+            },
+            "long_note_threshold_beats": 2.0,
+            "long_note_ornaments": ["breath_swell", "vibrato_light"],
+            "consecutive_step_threshold_beats": 0.5,
+            "consecutive_step_ornaments": ["legato_to_next"],
+            "phrase_end_ornaments": ["breath_fade"],
+            "velocity_curve": "swell",
+        },
+        "auto_rules": [
+            {"condition": "first_of_phrase",
+             "add_ornaments": ["breath_swell"]},
+        ],
+        "ornament_vocabulary": [
+            "breath_swell", "breath_fade", "flutter",
+            "vibrato_light", "grace_note_above",
+            "legato_to_next", "staccato", "tenuto",
+        ],
+        "spotlight_profile": {
+            "typical_role": "lead",
+            "good_at": ["chorus", "bridge"],
+            "avoid": [],
+            "pairs_with": ["strings", "piano"],
+            "competes_with": ["dizi", "xiao"],
+        },
+    },
+
+    "trumpet": {
+        "ornament_vocabulary": [
+            "staccato", "tenuto", "legato_to_next",
+            "slide_up_to", "overblow",
+        ],
+        "spotlight_profile": {
+            "typical_role": "lead",
+            "good_at": ["chorus"],
+            "avoid": ["intro"],
+            "pairs_with": ["piano", "drums"],
+            "competes_with": [],
+        },
+    },
+
+    "clarinet": {
+        "performance_recipes": {
+            "default_vibrato": {
+                "type": "vibrato_light", "depth": 20, "rate_hz": 4.5,
+            },
+            "long_note_threshold_beats": 2.0,
+            "long_note_ornaments": ["vibrato_light"],
+            "consecutive_step_threshold_beats": 0.5,
+            "consecutive_step_ornaments": ["legato_to_next"],
+            "phrase_end_ornaments": [],
+            "velocity_curve": "swell",
+        },
+        "auto_rules": [],
+        "ornament_vocabulary": [
+            "vibrato_light", "breath_swell", "breath_fade",
+            "legato_to_next", "staccato", "tenuto",
+        ],
+        "spotlight_profile": {
+            "typical_role": "counter-melody",
+            "good_at": ["verse", "bridge"],
+            "avoid": [],
+            "pairs_with": ["piano", "strings"],
+            "competes_with": ["flute"],
+        },
+    },
+
+    "harp": {
+        "ornament_vocabulary": [
+            "glissando_from", "glissando_to",
+            "tremolo_rapid", "tenuto",
+        ],
+        "spotlight_profile": {
+            "typical_role": "texture",
+            "good_at": ["intro", "bridge", "outro"],
+            "avoid": [],
+            "pairs_with": ["strings", "pad"],
+            "competes_with": ["guzheng", "yangqin"],
+        },
+    },
+
+    "contrabass": {
+        "ornament_vocabulary": [
+            "staccato", "tenuto", "legato_to_next",
+        ],
+        "spotlight_profile": {
+            "typical_role": "bass",
+            "good_at": ["verse", "chorus"],
+            "avoid": [],
+            "pairs_with": ["piano", "drums"],
+            "competes_with": ["cello"],
+        },
+    },
+
+    "viola": {
+        "performance_recipes": {
+            "default_vibrato": {
+                "type": "vibrato_light", "depth": 25, "rate_hz": 5.0,
+            },
+            "long_note_threshold_beats": 2.0,
+            "long_note_ornaments": ["vibrato_light"],
+            "consecutive_step_threshold_beats": 0.5,
+            "consecutive_step_ornaments": ["legato_to_next"],
+            "phrase_end_ornaments": [],
+            "velocity_curve": "swell",
+        },
+        "auto_rules": [
+            {"condition": "duration > 2.0",
+             "add_ornaments": ["vibrato_light"]},
+        ],
+        "ornament_vocabulary": [
+            "vibrato_light", "legato_to_next",
+            "staccato", "tenuto",
+        ],
+        "spotlight_profile": {
+            "typical_role": "texture",
+            "good_at": ["bridge"],
+            "avoid": [],
+            "pairs_with": ["cello", "violin"],
+            "competes_with": ["strings"],
+        },
+    },
+}
+
+
+# Run the merge + validation at import time so failures are immediate.
+_merge_extensions()

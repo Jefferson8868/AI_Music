@@ -33,26 +33,37 @@ from src.agents.synthesizer import SynthesizerAgent
 from src.llm.client import create_llm_client
 from src.llm.prompts import (
     build_composer_section_prompt,
-    build_composer_lead_sheet_prompt,
-    build_inner_composer_prompt,
-    build_overlap_context,
+    build_spotlight_review_prompt,
 )
 from src.knowledge.instruments import (
     format_for_composer,
     format_for_instrumentalist,
     format_for_critic,
-    INSTRUMENT_CARDS,
+    get_ornament_vocabulary,
+)
+from src.knowledge.spotlight_presets import (
+    build_default_all_active,
+    detect_preset_from_request,
+    expand_preset,
 )
 from src.music.models import MusicRequest
+from src.music.ornaments import (
+    ORNAMENT_MACROS,
+    ornament_is_known,
+)
+from src.music.performance import apply_performance_render
 from src.music.score import (
     Score, ScoreNote, ScoreSection, ScoreTrack,
-    MainScore,
+    SpotlightEntry, SpotlightProposal,
     compute_score_metrics, format_metrics_for_critic,
-    compute_density_heatmap, compute_note_grid,
-    detect_gaps, compute_register_coverage,
 )
 from src.music.midi_writer import save_score_midi
 from config.settings import settings
+
+# Confidence thresholds for spotlight proposals.
+SPOTLIGHT_AUTO_ACCEPT = 0.9
+SPOTLIGHT_AUTO_DROP = 0.7
+LYRICS_MIN_TOTAL_LINES = 4  # verse + chorus combined
 
 
 ProgressCallback = Callable[[str, str, float], Awaitable[None]]
@@ -184,11 +195,13 @@ def _extract_tracks_from_json(
                 if dur is None:
                     dur = 1.0
                 vel = n.get("velocity", 80)
+                ornaments = _sanitize_ornaments(n.get("ornaments"))
                 result.setdefault(name, []).append({
                     "pitch": pitch,
                     "start_beat": float(start),
                     "duration_beats": dur,
                     "velocity": min(127, max(1, int(vel))),
+                    "ornaments": ornaments,
                 })
     if not result and "edits" in data and isinstance(data["edits"], list):
         for edit in data["edits"]:
@@ -291,6 +304,278 @@ def _enrich_sections(
         })
         offset = end
     return enriched
+
+
+# ---------------------------------------------------------------------------
+# Spotlight plan helpers
+# ---------------------------------------------------------------------------
+
+def _parse_spotlight_from_orch(
+    orch_data: dict, all_instruments: list[str],
+) -> list[SpotlightEntry]:
+    """Parse a spotlight_plan block from Orchestrator JSON output."""
+    raw = orch_data.get("spotlight_plan", [])
+    if not isinstance(raw, list) or not raw:
+        return []
+    all_lower = {i.lower(): i for i in all_instruments}
+    entries: list[SpotlightEntry] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        sec = str(item.get("section", "")).strip()
+        if not sec:
+            continue
+        active_spec = item.get("active", [])
+        if active_spec == "ALL":
+            active = list(all_instruments)
+        elif isinstance(active_spec, list):
+            active = []
+            for token in active_spec:
+                if not isinstance(token, str):
+                    continue
+                key = token.strip().lower()
+                if key in all_lower and all_lower[key] not in active:
+                    active.append(all_lower[key])
+                else:
+                    # substring match fallback
+                    for lower, original in all_lower.items():
+                        if (
+                            (key in lower or lower in key)
+                            and original not in active
+                        ):
+                            active.append(original)
+                            break
+        else:
+            active = list(all_instruments)
+        featured_raw = item.get("featured", [])
+        featured: list[str] = []
+        if isinstance(featured_raw, list):
+            for token in featured_raw:
+                if not isinstance(token, str):
+                    continue
+                key = token.strip().lower()
+                if key in all_lower and all_lower[key] in active:
+                    if all_lower[key] not in featured:
+                        featured.append(all_lower[key])
+        silent = [i for i in all_instruments if i not in active]
+        entries.append(SpotlightEntry(
+            section=sec, active=active,
+            featured=featured, silent=silent,
+        ))
+    return entries
+
+
+def _ensure_spotlight_plan(
+    orch_data: dict,
+    blueprint_instruments: list[dict],
+    enriched_sections: list[dict],
+    request_description: str,
+) -> list[SpotlightEntry]:
+    """Return a complete spotlight plan for every enriched section.
+
+    Priority:
+      1) Orchestrator's spotlight_plan (sections matched by name).
+      2) For missing sections: preset inferred from request + instruments.
+      3) Fallback: all instruments active everywhere.
+    """
+    all_inst_names = [i.get("name", "") for i in blueprint_instruments if i.get("name")]
+    section_names = [s["name"] for s in enriched_sections]
+
+    orch_entries = _parse_spotlight_from_orch(orch_data, all_inst_names)
+    orch_map = {e.section.lower(): e for e in orch_entries}
+
+    preset_name = detect_preset_from_request(
+        request_description, all_inst_names,
+    )
+    preset_entries = expand_preset(
+        preset_name, all_inst_names, section_names,
+    )
+    preset_map = {e.section.lower(): e for e in preset_entries}
+
+    fallback_entries = build_default_all_active(
+        all_inst_names, section_names,
+    )
+    fallback_map = {e.section.lower(): e for e in fallback_entries}
+
+    final: list[SpotlightEntry] = []
+    for name in section_names:
+        key = name.lower()
+        if key in orch_map:
+            entry = orch_map[key]
+            # normalize section name to enriched name (case may differ)
+            entry.section = name
+            final.append(entry)
+            continue
+        if key in preset_map:
+            entry = preset_map[key]
+            entry.section = name
+            final.append(entry)
+            continue
+        final.append(fallback_map[key])
+    logger.info(
+        f"[spotlight] preset='{preset_name}', "
+        f"orch_sections={len(orch_entries)}, "
+        f"total_sections={len(final)}"
+    )
+    return final
+
+
+def _get_spotlight_for_section(
+    plan: list[SpotlightEntry], section_name: str,
+) -> SpotlightEntry | None:
+    key = section_name.lower()
+    for entry in plan:
+        if entry.section.lower() == key:
+            return entry
+    return None
+
+
+def _build_section_ornament_vocab(
+    featured_instruments: list[str],
+) -> list[str]:
+    """Build an ornament-token vocabulary tailored to a section's featured
+    instruments. Lines look like:  "breath_swell (dizi): air rises into note."
+    """
+    universal = [
+        "vibrato_light", "staccato", "tenuto", "legato_to_next",
+        "grace_note_above", "grace_note_below",
+    ]
+    seen: list[str] = []
+    lines: list[str] = []
+    for inst in featured_instruments:
+        for token in get_ornament_vocabulary(inst):
+            if token in seen:
+                continue
+            seen.append(token)
+            spec = ORNAMENT_MACROS.get(token)
+            desc = spec.description if spec else ""
+            lines.append(f"{token} ({inst}): {desc}")
+    for token in universal:
+        if token in seen:
+            continue
+        spec = ORNAMENT_MACROS.get(token)
+        desc = spec.description if spec else ""
+        lines.append(f"{token}: {desc}")
+    return lines
+
+
+def _extract_spotlight_proposals_from_json(
+    data: dict,
+) -> list[SpotlightProposal]:
+    """Parse spotlight proposals from a Composer or Critic JSON response."""
+    found: list[SpotlightProposal] = []
+    candidates = []
+    if isinstance(data.get("spotlight_proposal"), dict):
+        candidates.append(data["spotlight_proposal"])
+    raw_list = data.get("spotlight_proposals")
+    if isinstance(raw_list, list):
+        candidates.extend([x for x in raw_list if isinstance(x, dict)])
+    for c in candidates:
+        try:
+            prop = SpotlightProposal(
+                section=str(c.get("section", "")).strip(),
+                add_instruments=[
+                    str(x) for x in c.get("add_instruments", [])
+                    if isinstance(x, str)
+                ],
+                remove_instruments=[
+                    str(x) for x in c.get("remove_instruments", [])
+                    if isinstance(x, str)
+                ],
+                reasoning=str(c.get("reasoning", "")),
+                confidence=float(c.get("confidence", 0.0) or 0.0),
+            )
+        except (TypeError, ValueError):
+            continue
+        if not prop.section:
+            continue
+        if not prop.add_instruments and not prop.remove_instruments:
+            continue
+        found.append(prop)
+    return found
+
+
+def _apply_proposal_to_plan(
+    plan: list[SpotlightEntry],
+    prop: SpotlightProposal,
+    all_instruments: list[str],
+    source: str,
+) -> bool:
+    """Merge an accepted proposal into the spotlight plan.
+
+    Returns True if the plan was modified.
+    """
+    entry = _get_spotlight_for_section(plan, prop.section)
+    if entry is None:
+        logger.warning(
+            f"[spotlight] proposal references unknown "
+            f"section '{prop.section}', skipped"
+        )
+        return False
+    all_lower = {i.lower(): i for i in all_instruments}
+    changed = False
+    for token in prop.add_instruments:
+        key = token.strip().lower()
+        if key not in all_lower:
+            continue
+        canonical = all_lower[key]
+        if canonical not in entry.active:
+            entry.active.append(canonical)
+            changed = True
+        if canonical in entry.silent:
+            entry.silent.remove(canonical)
+            changed = True
+    for token in prop.remove_instruments:
+        key = token.strip().lower()
+        if key not in all_lower:
+            continue
+        canonical = all_lower[key]
+        if canonical in entry.active:
+            entry.active.remove(canonical)
+            changed = True
+        if canonical in entry.featured:
+            entry.featured.remove(canonical)
+            changed = True
+        if canonical not in entry.silent:
+            entry.silent.append(canonical)
+            changed = True
+    if changed:
+        logger.info(
+            f"[spotlight] ({source}) applied proposal to "
+            f"'{prop.section}' conf={prop.confidence:.2f}: "
+            f"+{prop.add_instruments} -{prop.remove_instruments}"
+        )
+    return changed
+
+
+# ---------------------------------------------------------------------------
+# Ornament extraction
+# ---------------------------------------------------------------------------
+
+def _sanitize_ornaments(raw) -> list[str]:
+    """Normalize an ornaments field on a note payload."""
+    if not raw:
+        return []
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list):
+        return []
+    cleaned: list[str] = []
+    for t in raw:
+        if not isinstance(t, str):
+            continue
+        token = t.strip()
+        if not token:
+            continue
+        if not ornament_is_known(token):
+            logger.debug(
+                f"[ornament] dropped unknown token: {token!r}"
+            )
+            continue
+        if token in cleaned:
+            continue
+        cleaned.append(token)
+    return cleaned
 
 
 # ---------------------------------------------------------------------------
@@ -665,138 +950,15 @@ def _build_score_from_composer(
 
 
 # ---------------------------------------------------------------------------
-# Nested-loop helpers
-# ---------------------------------------------------------------------------
-
-_ROLE_PRIORITY = {
-    "lead": 1, "melody": 1,
-    "counter-melody": 2, "counter": 2,
-    "accompaniment": 3, "chords": 3, "harmony": 3,
-    "bass": 4,
-    "pad": 5, "texture": 5,
-}
-
-
-def _sort_instruments_by_priority(instruments: list[dict]) -> list[dict]:
-    """Order instruments by role priority: lead first, pad last."""
-    def _key(inst):
-        role = inst.get("role", "accompaniment").lower()
-        return _ROLE_PRIORITY.get(role, 3)
-    return sorted(instruments, key=_key)
-
-
-def _build_role_density_minimums() -> dict[str, int]:
-    """Map role names to minimum notes/bar from config."""
-    return {
-        "lead": settings.min_density_lead,
-        "melody": settings.min_density_lead,
-        "counter-melody": settings.min_density_counter,
-        "counter": settings.min_density_counter,
-        "accompaniment": settings.min_density_accomp,
-        "chords": settings.min_density_accomp,
-        "harmony": settings.min_density_accomp,
-        "bass": settings.min_density_bass,
-        "pad": 1,
-        "texture": 1,
-    }
-
-
-def _build_instrument_ranges(instruments: list[dict]) -> dict[str, tuple[int, int]]:
-    """Look up sweet-spot ranges from INSTRUMENT_CARDS."""
-    ranges = {}
-    for inst in instruments:
-        name = inst.get("name", "")
-        name_lower = name.lower()
-        for card_key, card in INSTRUMENT_CARDS.items():
-            if card_key in name_lower or name_lower in card_key:
-                sweet = card.get("sweet_spot")
-                if sweet:
-                    ranges[name] = tuple(sweet)
-                break
-    return ranges
-
-
-def _extract_main_score_from_response(text: str) -> MainScore | None:
-    """Parse lead-sheet JSON into MainScore."""
-    for data in _find_json_objects(text):
-        melody_raw = data.get("melody", [])
-        if not isinstance(melody_raw, list) or not melody_raw:
-            continue
-        melody = []
-        for n in melody_raw:
-            if not isinstance(n, dict):
-                continue
-            pitch = _parse_pitch(n.get("pitch"))
-            if pitch is None:
-                continue
-            melody.append(ScoreNote(
-                pitch=pitch,
-                start_beat=float(n.get("start_beat", 0)),
-                duration_beats=float(n.get("duration_beats", 1.0)),
-                velocity=int(n.get("velocity", 80)),
-            ))
-        if not melody:
-            continue
-        return MainScore(
-            melody=melody,
-            chord_progression=data.get("chord_progression", []),
-            rhythm_guide=data.get("rhythm_guide", {}),
-            instrument_plan=data.get("instrument_plan", {}),
-        )
-    return None
-
-
-def _format_arranged_instruments_context(
-    score: Score,
-    arranged_instruments: list[str],
-    section_start: float,
-    section_end: float,
-) -> str:
-    """Format note grids of previously arranged instruments for context.
-
-    Uses compute_note_grid for detailed view of the section.
-    """
-    if not arranged_instruments:
-        return ""
-    bpb = score.time_signature[0] if score.time_signature else 4
-    # Compute bar range for this section (0-indexed beats)
-    start_bar = int(section_start / bpb) + 1
-    end_bar = int(section_end / bpb)
-    if end_bar < start_bar:
-        end_bar = start_bar
-
-    parts = []
-    for inst_name in arranged_instruments:
-        trk_name = inst_name.lower()
-        trk = score.get_track(inst_name) or score.get_track(trk_name)
-        if not trk:
-            continue
-        sec_notes = [
-            n for n in trk.notes
-            if section_start <= n.start_beat < section_end
-        ]
-        if not sec_notes:
-            parts.append(f"  {inst_name}: (silent in this section)")
-            continue
-        # Use note grid for detailed view (limit to 4 bars to save tokens)
-        grid_end = min(end_bar, start_bar + 3)
-        grid_text = compute_note_grid(score, trk.name, start_bar, grid_end, bpb)
-        parts.append(grid_text)
-    return "\n".join(parts) if parts else ""
-
-
-# ---------------------------------------------------------------------------
 # Pipeline
 # ---------------------------------------------------------------------------
 
 class MusicGenerationPipeline:
     """
-    Three-phase pipeline with nested loops:
+    Two-phase pipeline with direct agent calls:
       Phase 1: Orchestrator blueprint + Synthesizer draft
-      Phase 2: Lead sheet creation (melody + chords + rhythm guide)
-      Phase 3: Nested refinement
-               Outer loop: per-instrument inner loops + Ensemble Critic
-               Inner loop: Composer + Instrumentalist + Inner Critic
+      Phase 2: Collaborative refinement loop
+               Composer (per-section) -> Lyricist -> Instrumentalist -> Critic
     """
 
     def __init__(
@@ -837,44 +999,664 @@ class MusicGenerationPipeline:
         snapshots: list[str] = []
         drafts_dir = settings.output_dir / "drafts"
         drafts_dir.mkdir(parents=True, exist_ok=True)
+        grid = settings.quantization_grid
+
+        title, key, scale_type = "Untitled", "C", "major"
+        tempo: int = request.tempo or 120
+        time_sig = (
+            list(request.time_signature)
+            if request.time_signature else [4, 4]
+        )
+        bpb = time_sig[0]
+        blueprint_sections: list[dict] = []
+        enriched_sections: list[dict] = []
+        blueprint_instruments: list[dict] = []
+        track_instruments: dict[str, dict] = {}
+        lyrics: list[dict] = []
+        current_score: Score | None = None
+        all_tracks: dict[str, list[dict]] = {}
 
         if self._on_progress:
             await self._on_progress("start", "Pipeline started", 0.0)
 
         try:
             # ---- Phase 1: Setup ----
-            phase1 = await self._run_phase1_setup(
-                request, task_text, messages, snapshots, drafts_dir,
-            )
-            title = phase1["title"]
-            key = phase1["key"]
-            scale_type = phase1["scale_type"]
-            tempo = phase1["tempo"]
-            time_sig = phase1["time_sig"]
-            bpb = phase1["bpb"]
-            enriched_sections = phase1["enriched_sections"]
-            blueprint_instruments = phase1["blueprint_instruments"]
-            draft_description = phase1["draft_description"]
-            orch_resp = phase1["orch_resp"]
-            safe_t = phase1["safe_t"]
+            logger.info("=== Phase 1: Setup ===")
 
-            # ---- Phase 2: Lead Sheet Creation ----
-            main_score, lyrics = await self._run_phase2_lead_sheet(
-                enriched_sections, blueprint_instruments,
-                key, scale_type, draft_description,
-                orch_resp, messages, snapshots, drafts_dir, safe_t,
+            # 1a. Orchestrator
+            if self._on_progress:
+                await self._on_progress(
+                    "orchestrator", "Creating blueprint", 0.05,
+                )
+
+            orch_resp = await self._call_agent(
+                self.orchestrator, messages, task_text,
+            )
+            messages.append({
+                "source": "orchestrator", "content": orch_resp,
+            })
+            logger.info(
+                f"[Phase1] Orchestrator responded "
+                f"({len(orch_resp)} chars)"
             )
 
-            # ---- Phase 3: Nested Refinement ----
-            final_score, articulations = await self._run_phase3_nested_refinement(
-                main_score, lyrics, blueprint_instruments,
-                enriched_sections, key, scale_type, tempo, time_sig,
-                messages, snapshots, drafts_dir, safe_t,
-                orch_resp=orch_resp, draft_description=draft_description,
+            orch_data_full: dict = {}
+            for data in _find_json_objects(orch_resp):
+                title = data.get("title", title)
+                key = data.get("key", key)
+                scale_type = data.get("scale_type", scale_type)
+                tempo = data.get("tempo", tempo)
+                time_sig = data.get("time_signature", time_sig)
+                bpb = time_sig[0]
+                blueprint_sections = []
+                for sec in data.get("sections", []):
+                    if isinstance(sec, dict) and "name" in sec:
+                        blueprint_sections.append(sec)
+                for inst in data.get("instruments", []):
+                    if isinstance(inst, dict) and "name" in inst:
+                        blueprint_instruments.append(inst)
+                if "spotlight_plan" in data:
+                    orch_data_full = data
+
+            enriched_sections = _enrich_sections(
+                blueprint_sections, bpb,
+            )
+            logger.info(
+                f"[Phase1] Enriched {len(enriched_sections)} sections "
+                f"with absolute beat ranges"
+            )
+            for sec in enriched_sections:
+                logger.info(
+                    f"  [{sec['name']}] bars={sec['bars']} "
+                    f"beats={sec['start_beat']:.0f}"
+                    f"-{sec['end_beat']:.0f}"
+                )
+
+            # Spotlight plan (proposed by Orchestrator or preset-derived).
+            spotlight_plan: list[SpotlightEntry] = _ensure_spotlight_plan(
+                orch_data_full or {},
+                blueprint_instruments,
+                enriched_sections,
+                request.description or "",
+            )
+            for entry in spotlight_plan:
+                logger.info(
+                    f"  spotlight[{entry.section}] "
+                    f"active={entry.active} "
+                    f"featured={entry.featured}"
+                )
+
+            safe_t = _safe_title(title)
+
+            # 1b. Synthesizer (Magenta draft)
+            if self._on_progress:
+                await self._on_progress(
+                    "synthesizer", "Generating Magenta draft", 0.1,
+                )
+
+            synth_resp = await self._call_agent(
+                self.synthesizer, messages, task_text,
+            )
+            messages.append({
+                "source": "synthesizer", "content": synth_resp,
+            })
+            logger.info(
+                f"[Phase1] Synthesizer responded "
+                f"({len(synth_resp)} chars)"
             )
 
-            if not final_score:
-                logger.warning("No score produced -- returning empty result")
+            draft_score = _build_score_from_composer(
+                synth_resp, title, key, scale_type, tempo, time_sig,
+                blueprint_sections, {}, [],
+            )
+            draft_description = ""
+            if draft_score:
+                draft_path = str(
+                    drafts_dir / f"{safe_t}_round0_magenta.mid"
+                )
+                save_score_midi(draft_score, draft_path)
+                snapshots.append(draft_path)
+                draft_description = draft_score.to_llm_description()
+                logger.info(
+                    f"[Phase1] Magenta draft saved: {draft_path}"
+                )
+            else:
+                logger.warning(
+                    "[Phase1] No usable score from Magenta"
+                )
+
+            # ---- Phase 2: Collaborative Refinement Loop ----
+            logger.info("=== Phase 2: Collaborative Refinement ===")
+            max_rounds = settings.max_refinement_rounds
+            critic_feedback = ""
+
+            for rnd in range(1, max_rounds + 1):
+                base_progress = 0.15 + (
+                    (rnd - 1) / max_rounds
+                ) * 0.75
+                step = 0.75 / max_rounds / 4
+
+                # -- 2a. Composer (per-section) --
+                if self._on_progress:
+                    await self._on_progress(
+                        "composer",
+                        f"Round {rnd}/{max_rounds}: Composing",
+                        base_progress,
+                    )
+
+                all_tracks = {}
+                completed = []
+                collected_proposals: list[tuple[str, SpotlightProposal]] = []
+                inst_knowledge_cache = _build_composer_knowledge(
+                    blueprint_instruments,
+                )
+                for si, sec in enumerate(enriched_sections):
+                    prev_summary = _previous_section_summary(
+                        all_tracks, completed,
+                    )
+
+                    sec_spotlight = _get_spotlight_for_section(
+                        spotlight_plan, sec["name"],
+                    )
+                    if sec_spotlight:
+                        active_instruments = list(sec_spotlight.active)
+                        featured_instruments = list(sec_spotlight.featured)
+                    else:
+                        active_instruments = [
+                            i.get("name", "")
+                            for i in blueprint_instruments
+                        ]
+                        featured_instruments = []
+
+                    # Build section-specific inst knowledge: featured first,
+                    # only cards for active instruments.
+                    inst_knowledge: list[str] = []
+                    active_lower = {a.lower() for a in active_instruments}
+                    feat_lower = {f.lower() for f in featured_instruments}
+                    for inst in blueprint_instruments:
+                        iname = inst.get("name", "")
+                        if iname.lower() not in active_lower:
+                            continue
+                        is_feat = iname.lower() in feat_lower
+                        text = format_for_composer(
+                            iname,
+                            inst.get("role", "accompaniment"),
+                            section=sec["name"],
+                            is_featured=is_feat,
+                        )
+                        if text:
+                            inst_knowledge.append(text)
+                    if not inst_knowledge:
+                        inst_knowledge = inst_knowledge_cache
+
+                    ornament_vocab = _build_section_ornament_vocab(
+                        featured_instruments,
+                    )
+
+                    section_prompt = build_composer_section_prompt(
+                        section_name=sec["name"],
+                        start_beat=sec["start_beat"],
+                        end_beat=sec["end_beat"],
+                        bars=sec["bars"],
+                        mood=sec.get("mood", ""),
+                        instruments=blueprint_instruments,
+                        key=key,
+                        scale_type=scale_type,
+                        previous_summary=prev_summary,
+                        draft_description=(
+                            draft_description if rnd == 1 else ""
+                        ),
+                        critic_feedback=(
+                            critic_feedback if si == 0 else ""
+                        ),
+                        instrument_knowledge=inst_knowledge,
+                        active_instruments=active_instruments,
+                        featured_instruments=featured_instruments,
+                        ornament_vocabulary=ornament_vocab,
+                    )
+
+                    comp_resp = await self._call_agent(
+                        self.composer, messages, section_prompt,
+                    )
+                    messages.append({
+                        "source": "composer", "content": comp_resp,
+                    })
+
+                    section_tracks = None
+                    for data in _find_json_objects(comp_resp):
+                        # Collect spotlight proposals before anything else
+                        for prop in _extract_spotlight_proposals_from_json(
+                            data,
+                        ):
+                            collected_proposals.append(
+                                ("composer", prop)
+                            )
+                        candidate = _extract_tracks_from_json(data)
+                        if candidate and section_tracks is None:
+                            section_tracks = candidate
+
+                    if section_tracks:
+                        # Drop tracks for silent instruments in THIS section.
+                        filtered: dict[str, list[dict]] = {}
+                        for trk_name, notes in section_tracks.items():
+                            if active_instruments:
+                                matched = False
+                                tn = trk_name.lower()
+                                for ai in active_instruments:
+                                    ail = ai.lower()
+                                    if (
+                                        ail == tn
+                                        or ail in tn
+                                        or tn in ail
+                                    ):
+                                        matched = True
+                                        break
+                                if not matched:
+                                    logger.info(
+                                        f"[spotlight] dropping silent "
+                                        f"track '{trk_name}' from "
+                                        f"[{sec['name']}]"
+                                    )
+                                    continue
+                            filtered[trk_name] = notes
+                        for trk_name, notes in filtered.items():
+                            notes = _quantize_notes(notes, grid)
+                            notes = _clamp_to_section(
+                                notes,
+                                sec["start_beat"],
+                                sec["end_beat"],
+                            )
+                            notes = _clamp_pitch_range(
+                                notes, trk_name,
+                            )
+                            all_tracks.setdefault(
+                                trk_name, [],
+                            ).extend(notes)
+                        logger.info(
+                            f"[Round {rnd}] [{sec['name']}] "
+                            f"extracted "
+                            f"{sum(len(n) for n in filtered.values())}"
+                            f" notes (after spotlight filter)"
+                        )
+                    else:
+                        logger.warning(
+                            f"[Round {rnd}] [{sec['name']}] "
+                            f"no notes extracted"
+                        )
+
+                    completed.append(sec)
+
+                # After composing all sections: review spotlight proposals.
+                if collected_proposals:
+                    await self._review_and_apply_proposals(
+                        proposals=collected_proposals,
+                        spotlight_plan=spotlight_plan,
+                        blueprint_instruments=blueprint_instruments,
+                        messages=messages,
+                    )
+
+                total_n = sum(len(n) for n in all_tracks.values())
+                logger.info(
+                    f"[Round {rnd}] Composer total: {total_n} notes "
+                    f"across {len(all_tracks)} tracks"
+                )
+
+                current_score = _build_score_from_sections(
+                    all_tracks, title, key, scale_type, tempo,
+                    time_sig, enriched_sections,
+                    track_instruments, lyrics,
+                )
+                if current_score:
+                    snap = str(
+                        drafts_dir / f"{safe_t}_round{rnd}.mid"
+                    )
+                    save_score_midi(current_score, snap)
+                    snapshots.append(snap)
+                    logger.info(
+                        f"[Round {rnd}] Snapshot: {snap}"
+                    )
+
+                # -- 2b. Lyricist --
+                if self._on_progress:
+                    await self._on_progress(
+                        "lyricist",
+                        f"Round {rnd}/{max_rounds}: Writing lyrics",
+                        base_progress + step,
+                    )
+
+                lyricist_context = f"Blueprint:\n{orch_resp}\n\n"
+                lyricist_context += (
+                    "Section beat ranges "
+                    "(computed by system, use these exactly):\n"
+                )
+                for sec in enriched_sections:
+                    lyricist_context += (
+                        f"  [{sec['name']}] beats "
+                        f"{sec['start_beat']:.0f}"
+                        f"-{sec['end_beat']:.0f}\n"
+                    )
+                lyricist_context += "\n"
+
+                if current_score:
+                    skeleton = _extract_melody_skeleton(
+                        current_score, enriched_sections,
+                    )
+                    skel_text = _format_skeleton_for_lyricist(
+                        skeleton, enriched_sections,
+                    )
+                    lyricist_context += skel_text + "\n\n"
+
+                if lyrics:
+                    lyricist_context += (
+                        "Previous lyrics (revise or keep):\n"
+                        + json.dumps(
+                            lyrics, ensure_ascii=False,
+                        )[:1500]
+                        + "\n\n"
+                    )
+                if critic_feedback:
+                    lyricist_context += (
+                        f"Critic feedback:\n{critic_feedback}\n\n"
+                    )
+                lyricist_context += (
+                    "Write or revise lyrics. "
+                    "Place each lyric ONLY on melody note beats."
+                )
+
+                lyr_resp = await self._call_agent(
+                    self.lyricist, messages, lyricist_context,
+                )
+                messages.append({
+                    "source": "lyricist", "content": lyr_resp,
+                })
+                logger.info(
+                    f"[Round {rnd}] Lyricist responded "
+                    f"({len(lyr_resp)} chars)"
+                )
+
+                lyrics = []
+                for data in _find_json_objects(lyr_resp):
+                    if (
+                        "lyrics" in data
+                        and isinstance(data["lyrics"], list)
+                    ):
+                        lyrics.extend(data["lyrics"])
+                    elif (
+                        "lines" in data
+                        and isinstance(data["lines"], list)
+                    ):
+                        lyrics.append(data)
+
+                if current_score and lyrics:
+                    melody_trk = next(
+                        (t for t in current_score.tracks
+                         if "melody" in t.name.lower()
+                         or t.role == "melody"),
+                        None,
+                    )
+                    if melody_trk:
+                        melody_beats = {
+                            n.start_beat for n in melody_trk.notes
+                        }
+                        lyrics = _filter_lyrics_to_melody(
+                            lyrics, melody_beats,
+                        )
+
+                # Lyrics re-prompt loop: ensure ≥LYRICS_MIN_TOTAL_LINES
+                # lines across verse+chorus when lyrics are requested.
+                if (
+                    request.include_lyrics
+                    and current_score is not None
+                ):
+                    total_lines = sum(
+                        len(b.get("lines", [])) for b in lyrics
+                        if b.get("section_name", "").lower()
+                        in ("verse", "chorus", "pre_chorus", "bridge")
+                    )
+                    if total_lines < LYRICS_MIN_TOTAL_LINES:
+                        logger.info(
+                            f"[Round {rnd}] Lyrics underfilled "
+                            f"({total_lines} lines), re-prompting"
+                        )
+                        reprompt_ctx = (
+                            lyricist_context
+                            + f"\n\nHARD REQUIREMENT: emit at LEAST "
+                            f"{LYRICS_MIN_TOTAL_LINES} lines total "
+                            "across the verse and chorus sections. "
+                            "Each line should span at least 4 melody "
+                            "beats. Do not skip chorus."
+                        )
+                        lyr_resp2 = await self._call_agent(
+                            self.lyricist, messages, reprompt_ctx,
+                        )
+                        messages.append({
+                            "source": "lyricist", "content": lyr_resp2,
+                        })
+                        extra_lyrics: list[dict] = []
+                        for data in _find_json_objects(lyr_resp2):
+                            if (
+                                "lyrics" in data
+                                and isinstance(data["lyrics"], list)
+                            ):
+                                extra_lyrics.extend(data["lyrics"])
+                            elif (
+                                "lines" in data
+                                and isinstance(data["lines"], list)
+                            ):
+                                extra_lyrics.append(data)
+                        if extra_lyrics:
+                            melody_trk = next(
+                                (t for t in current_score.tracks
+                                 if "melody" in t.name.lower()
+                                 or t.role == "melody"),
+                                None,
+                            )
+                            if melody_trk:
+                                mb = {
+                                    n.start_beat
+                                    for n in melody_trk.notes
+                                }
+                                extra_lyrics = _filter_lyrics_to_melody(
+                                    extra_lyrics, mb,
+                                )
+                            if extra_lyrics:
+                                lyrics = extra_lyrics
+
+                # -- 2c. Instrumentalist --
+                if self._on_progress:
+                    await self._on_progress(
+                        "instrumentalist",
+                        f"Round {rnd}/{max_rounds}: Orchestrating",
+                        base_progress + step * 2,
+                    )
+
+                inst_techniques = _build_instrumentalist_techniques(
+                    blueprint_instruments,
+                )
+                inst_context = ""
+                if inst_techniques:
+                    inst_context += (
+                        "INSTRUMENT TECHNIQUE REFERENCE:\n"
+                    )
+                    for tech in inst_techniques:
+                        inst_context += f"  {tech}\n"
+                    inst_context += "\n"
+                if current_score:
+                    inst_context += (
+                        f"Score summary:\n"
+                        f"{current_score.to_llm_description()}\n\n"
+                    )
+                inst_context += (
+                    "Section beat ranges:\n"
+                )
+                for sec in enriched_sections:
+                    inst_context += (
+                        f"  [{sec['name']}] beats "
+                        f"{sec['start_beat']:.0f}"
+                        f"-{sec['end_beat']:.0f}\n"
+                    )
+                inst_context += (
+                    "\nAssign instruments, MIDI channels, "
+                    "GM program numbers, and articulations. "
+                    "Use each instrument's specific techniques "
+                    "when assigning articulations."
+                )
+
+                inst_resp = await self._call_agent(
+                    self.instrumentalist, messages, inst_context,
+                )
+                messages.append({
+                    "source": "instrumentalist",
+                    "content": inst_resp,
+                })
+                logger.info(
+                    f"[Round {rnd}] Instrumentalist responded "
+                    f"({len(inst_resp)} chars)"
+                )
+
+                track_instruments = {}
+                articulations: dict[str, list[dict]] = {}
+                for data in _find_json_objects(inst_resp):
+                    for trk in data.get("tracks", []):
+                        if not isinstance(trk, dict):
+                            continue
+                        if "instrument" not in trk:
+                            continue
+                        iname = trk["instrument"]
+                        raw_p = int(trk.get("program_number", 0))
+                        prog = _map_instrument_program(iname, raw_p)
+                        track_instruments[iname] = {
+                            "instrument": iname,
+                            "role": trk.get(
+                                "role", "accompaniment",
+                            ),
+                            "channel": int(
+                                trk.get("midi_channel", 0),
+                            ),
+                            "program": prog,
+                        }
+                        arts = trk.get("articulations", [])
+                        if isinstance(arts, list) and arts:
+                            articulations[iname] = arts
+
+                track_instruments = _validate_channels(
+                    track_instruments,
+                )
+
+                # -- 2d. Critic --
+                if self._on_progress:
+                    await self._on_progress(
+                        "critic",
+                        f"Round {rnd}/{max_rounds}: Reviewing",
+                        base_progress + step * 3,
+                    )
+
+                inst_criteria = _build_critic_criteria(
+                    blueprint_instruments,
+                )
+                critic_context = ""
+                if inst_criteria:
+                    critic_context += (
+                        "INSTRUMENT-SPECIFIC EVALUATION "
+                        "CRITERIA:\n"
+                    )
+                    for criterion in inst_criteria:
+                        critic_context += f"{criterion}\n"
+                    critic_context += "\n"
+
+                if current_score:
+                    metrics = compute_score_metrics(
+                        current_score, enriched_sections, lyrics,
+                    )
+                    critic_context += (
+                        format_metrics_for_critic(metrics) + "\n\n"
+                    )
+                    critic_context += (
+                        "Score summary:\n"
+                        + current_score.to_llm_description()
+                        + "\n\n"
+                    )
+
+                if lyrics:
+                    critic_context += (
+                        "Lyrics:\n"
+                        + json.dumps(
+                            lyrics, ensure_ascii=False,
+                        )[:1500]
+                        + "\n\n"
+                    )
+
+                critic_context += (
+                    "\nCURRENT SPOTLIGHT PLAN "
+                    "(evaluate ensemble_spotlight):\n"
+                )
+                for entry in spotlight_plan:
+                    active_str = ", ".join(entry.active) or "-"
+                    feat_str = ", ".join(entry.featured) or "-"
+                    critic_context += (
+                        f"  {entry.section}: active=[{active_str}] "
+                        f"featured=[{feat_str}]\n"
+                    )
+                critic_context += "\n"
+
+                critic_context += (
+                    "Evaluate the music AND lyrics together. "
+                    "Use the metrics above as facts. "
+                    "Focus on qualitative musical judgment. "
+                    "Check instrument_idiom using the criteria "
+                    "above. Check ensemble_spotlight against the plan. "
+                    "Emit spotlight_proposals if the plan should change."
+                )
+
+                crit_resp = await self._call_agent(
+                    self.critic, messages, critic_context,
+                )
+                messages.append({
+                    "source": "critic", "content": crit_resp,
+                })
+                logger.info(
+                    f"[Round {rnd}] Critic responded "
+                    f"({len(crit_resp)} chars)"
+                )
+
+                passes = False
+                critic_proposals: list[
+                    tuple[str, SpotlightProposal]
+                ] = []
+                for data in _find_json_objects(crit_resp):
+                    passes = data.get("passes", False)
+                    critic_feedback = data.get(
+                        "revision_instructions", "",
+                    )
+                    score_val = data.get("overall_score", 0)
+                    for prop in _extract_spotlight_proposals_from_json(
+                        data,
+                    ):
+                        critic_proposals.append(("critic", prop))
+                    logger.info(
+                        f"[Round {rnd}] Critic "
+                        f"score={score_val}, "
+                        f"passes={passes}"
+                    )
+
+                if critic_proposals:
+                    await self._review_and_apply_proposals(
+                        proposals=critic_proposals,
+                        spotlight_plan=spotlight_plan,
+                        blueprint_instruments=blueprint_instruments,
+                        messages=messages,
+                    )
+
+                if passes:
+                    logger.info(
+                        f"[Round {rnd}] Critic passed"
+                    )
+                    break
+
+            if not current_score:
+                logger.warning(
+                    "No score produced -- returning empty result"
+                )
                 return PipelineResult(
                     messages=messages,
                     total_messages=len(messages),
@@ -884,13 +1666,52 @@ class MusicGenerationPipeline:
 
             # ---- Build final MIDI ----
             logger.info("=== Building final MIDI ===")
+            final_score = _build_score_from_sections(
+                all_tracks, title, key, scale_type, tempo,
+                time_sig, enriched_sections,
+                track_instruments, lyrics,
+            )
+            if not final_score:
+                final_score = current_score
+
+            # ---- Phase 4: Performance render ----
+            # Ornament macros -> pitch-bend / CC / note retrigger events.
+            # Idempotent (ScoreTrack.rendered flag), so safe even if this
+            # function is ever invoked a second time.
+            try:
+                logger.info("=== Phase 4: Performance render ===")
+                final_score = apply_performance_render(final_score)
+                bend_count = sum(
+                    len(t.pitch_bends) for t in final_score.tracks
+                )
+                cc_count = sum(
+                    len(t.cc_events) for t in final_score.tracks
+                )
+                logger.info(
+                    f"[Phase4] Rendered {bend_count} pitch-bend events, "
+                    f"{cc_count} CC events across "
+                    f"{len(final_score.tracks)} tracks"
+                )
+            except Exception as e:
+                logger.warning(
+                    f"[Phase4] Performance render failed: {e}. "
+                    "Falling back to un-rendered score."
+                )
+
             ts = int(time.time())
-            midi_path = str(settings.output_dir / f"{safe_t}_{ts}.mid")
-            save_score_midi(final_score, midi_path, articulations=articulations)
+            midi_path = str(
+                settings.output_dir / f"{safe_t}_{ts}.mid"
+            )
+            save_score_midi(
+                final_score, midi_path,
+                articulations=articulations,
+            )
             logger.info(f"Final MIDI exported: {midi_path}")
 
             if self._on_progress:
-                await self._on_progress("done", "Pipeline complete", 1.0)
+                await self._on_progress(
+                    "done", "Pipeline complete", 1.0,
+                )
 
             return PipelineResult(
                 messages=messages,
@@ -914,658 +1735,112 @@ class MusicGenerationPipeline:
                 snapshots=snapshots,
             )
 
-    # ------------------------------------------------------------------
-    # Phase 1: Setup (Orchestrator + Synthesizer)
-    # ------------------------------------------------------------------
+    async def _review_and_apply_proposals(
+        self,
+        proposals: list[tuple[str, SpotlightProposal]],
+        spotlight_plan: list[SpotlightEntry],
+        blueprint_instruments: list[dict],
+        messages: list[dict],
+    ) -> None:
+        """Arbitrate spotlight proposals.
 
-    async def _run_phase1_setup(
-        self, request, task_text, messages, snapshots, drafts_dir,
-    ) -> dict:
-        logger.info("=== Phase 1: Setup ===")
-
-        title, key, scale_type = "Untitled", "C", "major"
-        tempo = request.tempo or 120
-        time_sig = list(request.time_signature) if request.time_signature else [4, 4]
-        bpb = time_sig[0]
-        blueprint_sections = []
-        blueprint_instruments = []
-
-        # 1a. Orchestrator
-        if self._on_progress:
-            await self._on_progress("orchestrator", "Creating blueprint", 0.03)
-
-        orch_resp = await self._call_agent(self.orchestrator, messages, task_text)
-        messages.append({"source": "orchestrator", "content": orch_resp})
-        logger.info(f"[Phase1] Orchestrator responded ({len(orch_resp)} chars)")
-
-        for data in _find_json_objects(orch_resp):
-            title = data.get("title", title)
-            key = data.get("key", key)
-            scale_type = data.get("scale_type", scale_type)
-            tempo = data.get("tempo", tempo)
-            time_sig = data.get("time_signature", time_sig)
-            bpb = time_sig[0]
-            blueprint_sections = []
-            for sec in data.get("sections", []):
-                if isinstance(sec, dict) and "name" in sec:
-                    blueprint_sections.append(sec)
-            for inst in data.get("instruments", []):
-                if isinstance(inst, dict) and "name" in inst:
-                    blueprint_instruments.append(inst)
-
-        enriched_sections = _enrich_sections(blueprint_sections, bpb)
-        # Add bar_start/bar_end for prompt builders
-        for sec in enriched_sections:
-            sec["bar_start"] = int((sec["start_beat"] - 1.0) / bpb) + 1
-            sec["bar_end"] = int((sec["end_beat"] - 1.0) / bpb)
-
-        logger.info(f"[Phase1] Enriched {len(enriched_sections)} sections")
-        for sec in enriched_sections:
-            logger.info(f"  [{sec['name']}] bars={sec['bars']} beats={sec['start_beat']:.0f}-{sec['end_beat']:.0f}")
-
-        safe_t = _safe_title(title)
-
-        # 1b. Synthesizer
-        if self._on_progress:
-            await self._on_progress("synthesizer", "Generating Magenta draft", 0.07)
-
-        synth_resp = await self._call_agent(self.synthesizer, messages, task_text)
-        messages.append({"source": "synthesizer", "content": synth_resp})
-
-        draft_score = _build_score_from_composer(
-            synth_resp, title, key, scale_type, tempo, time_sig,
-            blueprint_sections, {}, [],
-        )
-        draft_description = ""
-        if draft_score:
-            draft_path = str(drafts_dir / f"{safe_t}_round0_magenta.mid")
-            save_score_midi(draft_score, draft_path)
-            snapshots.append(draft_path)
-            draft_description = draft_score.to_llm_description()
-            logger.info(f"[Phase1] Magenta draft saved: {draft_path}")
-        else:
-            logger.warning("[Phase1] No usable score from Magenta")
-
-        return {
-            "title": title, "key": key, "scale_type": scale_type,
-            "tempo": tempo, "time_sig": time_sig, "bpb": bpb,
-            "enriched_sections": enriched_sections,
-            "blueprint_instruments": blueprint_instruments,
-            "draft_description": draft_description,
-            "orch_resp": orch_resp, "safe_t": safe_t,
-        }
-
-    # ------------------------------------------------------------------
-    # Phase 2: Lead Sheet Creation
-    # ------------------------------------------------------------------
-
-    async def _run_phase2_lead_sheet(
-        self, enriched_sections, blueprint_instruments,
-        key, scale_type, draft_description,
-        orch_resp, messages, snapshots, drafts_dir, safe_t,
-        critic_feedback="",
-    ) -> tuple[MainScore, list[dict]]:
-        logger.info("=== Phase 2: Lead Sheet Creation ===")
-        self.composer.set_mode("lead_sheet")
-        self.critic.set_mode("structural")
-
-        max_rounds = settings.max_refinement_rounds
-        main_score = None
-        lyrics: list[dict] = []
-        grid = settings.quantization_grid
-
-        for rnd in range(1, max_rounds + 1):
-            progress = 0.10 + (rnd - 1) / max_rounds * 0.20
-
-            # Composer: lead sheet
-            if self._on_progress:
-                await self._on_progress(
-                    "composer", f"Lead sheet round {rnd}/{max_rounds}", progress,
-                )
-
-            lead_prompt = build_composer_lead_sheet_prompt(
-                enriched_sections=enriched_sections,
-                key=key,
-                scale_type=scale_type,
-                instruments=blueprint_instruments,
-                draft_description=draft_description if rnd == 1 else "",
-                critic_feedback=critic_feedback,
-            )
-            comp_resp = await self._call_agent(self.composer, messages, lead_prompt)
-            messages.append({"source": "composer", "content": comp_resp})
-
-            candidate = _extract_main_score_from_response(comp_resp)
-            if candidate:
-                # Quantize melody
-                for n in candidate.melody:
-                    n.start_beat = _quantize_beat(n.start_beat, grid)
-                    n.duration_beats = max(grid, _quantize_beat(n.duration_beats, grid))
-                main_score = candidate
-                logger.info(f"[Phase2] Lead sheet: {len(main_score.melody)} melody notes")
-            else:
-                logger.warning(f"[Phase2] Round {rnd}: no lead sheet extracted")
-                continue
-
-            # Build a temporary Score from melody for lyricist
-            melody_track = ScoreTrack(
-                name="melody", instrument="Lead", role="melody",
-                notes=list(main_score.melody),
-            )
-            # Build 0-indexed sections for Score (Score uses 0-indexed beats)
-            zero_indexed_sections = [
-                ScoreSection(
-                    name=sec["name"],
-                    start_beat=sec["start_beat"] - 1.0,
-                    bars=sec["bars"],
-                )
-                for sec in enriched_sections
-            ]
-            # Also build 0-indexed enriched dicts for functions that
-            # compare against Score note beats
-            enriched_0 = [
-                {**sec, "start_beat": sec["start_beat"] - 1.0, "end_beat": sec["end_beat"] - 1.0}
-                for sec in enriched_sections
-            ]
-            temp_score = Score(
-                title="Lead Sheet", key=key, scale_type=scale_type,
-                sections=zero_indexed_sections, tracks=[melody_track],
-            )
-
-            # Save lead sheet MIDI snapshot
-            snap = str(drafts_dir / f"{safe_t}_lead_sheet_r{rnd}.mid")
-            save_score_midi(temp_score, snap)
-            snapshots.append(snap)
-
-            # Lyricist
-            if self._on_progress:
-                await self._on_progress(
-                    "lyricist", f"Lead sheet round {rnd}: lyrics", progress + 0.05,
-                )
-
-            skeleton = _extract_melody_skeleton(temp_score, enriched_0)
-            skel_text = _format_skeleton_for_lyricist(skeleton, enriched_sections)
-
-            lyricist_context = f"Blueprint:\n{orch_resp}\n\n"
-            lyricist_context += "Section beat ranges:\n"
-            for sec in enriched_sections:
-                lyricist_context += f"  [{sec['name']}] beats {sec['start_beat']:.0f}-{sec['end_beat']:.0f}\n"
-            lyricist_context += f"\n{skel_text}\n\n"
-            if lyrics:
-                lyricist_context += f"Previous lyrics:\n{json.dumps(lyrics, ensure_ascii=False)[:1500]}\n\n"
-            if critic_feedback:
-                lyricist_context += f"Critic feedback:\n{critic_feedback}\n\n"
-            lyricist_context += "Write or revise lyrics. Place each lyric ONLY on melody note beats."
-
-            lyr_resp = await self._call_agent(self.lyricist, messages, lyricist_context)
-            messages.append({"source": "lyricist", "content": lyr_resp})
-
-            lyrics = []
-            for data in _find_json_objects(lyr_resp):
-                if "lyrics" in data and isinstance(data["lyrics"], list):
-                    lyrics.extend(data["lyrics"])
-                elif "lines" in data and isinstance(data["lines"], list):
-                    lyrics.append(data)
-
-            # Structural Critic
-            if self._on_progress:
-                await self._on_progress(
-                    "critic", f"Lead sheet round {rnd}: reviewing", progress + 0.10,
-                )
-
-            critic_ctx = f"Lead sheet summary:\n{main_score.to_description(key, scale_type)}\n\n"
-            critic_ctx += f"Melody note count: {len(main_score.melody)}\n"
-            critic_ctx += f"Chord entries: {len(main_score.chord_progression)}\n"
-            critic_ctx += f"Sections: {len(enriched_sections)}\n\n"
-            critic_ctx += "Evaluate the lead sheet. Is the melody compelling? Are chords coherent?"
-
-            crit_resp = await self._call_agent(self.critic, messages, critic_ctx)
-            messages.append({"source": "critic", "content": crit_resp})
-
-            passes = False
-            for data in _find_json_objects(crit_resp):
-                passes = data.get("passes", False)
-                critic_feedback = data.get("revision_instructions", "")
-                score_val = data.get("overall_score", 0)
-                logger.info(f"[Phase2] Structural Critic score={score_val}, passes={passes}")
-
-            if passes:
-                logger.info(f"[Phase2] Lead sheet approved at round {rnd}")
-                break
-
-        if not main_score:
-            logger.warning("[Phase2] No lead sheet produced, creating fallback")
-            main_score = MainScore(melody=[], chord_progression=[], rhythm_guide={}, instrument_plan={})
-
-        return main_score, lyrics
-
-    # ------------------------------------------------------------------
-    # Phase 3: Nested Refinement
-    # ------------------------------------------------------------------
-
-    async def _run_phase3_nested_refinement(
-        self, main_score, lyrics, blueprint_instruments,
-        enriched_sections, key, scale_type, tempo, time_sig,
-        messages, snapshots, drafts_dir, safe_t,
-        orch_resp="", draft_description="",
-    ) -> tuple[Score | None, dict]:
-        logger.info("=== Phase 3: Nested Refinement ===")
-
-        sorted_instruments = _sort_instruments_by_priority(blueprint_instruments)
-        role_mins = _build_role_density_minimums()
-        inst_ranges = _build_instrument_ranges(blueprint_instruments)
-        grid = settings.quantization_grid
-        bpb = time_sig[0] if time_sig else 4
-        max_outer = settings.max_outer_loops
-        articulations: dict[str, list[dict]] = {}
-        track_instruments: dict[str, dict] = {}
-
-        # Initialize score with sections but no tracks
-        sections = [
-            ScoreSection(
-                name=sec["name"],
-                start_beat=sec["start_beat"] - 1.0,
-                bars=sec["bars"],
-            )
-            for sec in enriched_sections
+        - confidence >= SPOTLIGHT_AUTO_ACCEPT: apply immediately.
+        - confidence <  SPOTLIGHT_AUTO_DROP: drop immediately.
+        - between: ask Orchestrator to decide (one batched call).
+        """
+        all_inst_names = [
+            i.get("name", "")
+            for i in blueprint_instruments if i.get("name")
         ]
-        current_score = Score(
-            title=safe_t, key=key, scale_type=scale_type,
-            tempo=tempo, time_signature=time_sig,
-            sections=sections, tracks=[],
+        auto_accept: list[tuple[str, SpotlightProposal]] = []
+        mid_conf: list[tuple[str, SpotlightProposal]] = []
+        dropped = 0
+        for source, prop in proposals:
+            if prop.confidence >= SPOTLIGHT_AUTO_ACCEPT:
+                auto_accept.append((source, prop))
+            elif prop.confidence < SPOTLIGHT_AUTO_DROP:
+                dropped += 1
+                logger.info(
+                    f"[spotlight] dropped {source} proposal "
+                    f"'{prop.section}' conf={prop.confidence:.2f} "
+                    "(below threshold)"
+                )
+            else:
+                mid_conf.append((source, prop))
+
+        for source, prop in auto_accept:
+            _apply_proposal_to_plan(
+                spotlight_plan, prop, all_inst_names,
+                source=f"{source}/auto",
+            )
+
+        if not mid_conf:
+            return
+
+        # Batched Orchestrator review for mid-confidence proposals.
+        current_spotlight_dicts = [
+            {
+                "section": e.section,
+                "active": list(e.active),
+                "featured": list(e.featured),
+            }
+            for e in spotlight_plan
+        ]
+        proposal_dicts = [
+            {
+                "section": p.section,
+                "add_instruments": p.add_instruments,
+                "remove_instruments": p.remove_instruments,
+                "reasoning": p.reasoning,
+                "confidence": p.confidence,
+            }
+            for _src, p in mid_conf
+        ]
+        review_prompt = build_spotlight_review_prompt(
+            proposals=proposal_dicts,
+            current_spotlight=current_spotlight_dicts,
         )
-
-        frozen_instruments: set[str] = set()
-        distribution_update = ""
-
-        for outer_rnd in range(1, max_outer + 1):
-            logger.info(f"=== Outer Loop {outer_rnd}/{max_outer} ===")
-            outer_progress_base = 0.30 + (outer_rnd - 1) / max_outer * 0.65
-            outer_step = 0.65 / max_outer
-
-            # Clear non-frozen instrument tracks at start of each outer loop
-            if outer_rnd > 1:
-                current_score.tracks = [
-                    t for t in current_score.tracks
-                    if t.instrument in frozen_instruments
-                ]
-
-            arranged_instruments: list[str] = [
-                t.instrument for t in current_score.tracks
-            ]
-
-            for inst_idx, inst_info in enumerate(sorted_instruments):
-                inst_name = inst_info.get("name", "")
-                inst_role = inst_info.get("role", "accompaniment")
-
-                if inst_name in frozen_instruments:
-                    logger.info(f"  [{inst_name}] frozen, skipping")
+        logger.info(
+            f"[spotlight] Orchestrator reviewing "
+            f"{len(mid_conf)} mid-confidence proposal(s)"
+        )
+        try:
+            review_resp = await self._call_agent(
+                self.orchestrator, messages, review_prompt,
+            )
+        except Exception as e:
+            logger.warning(
+                f"[spotlight] review call failed ({e}), "
+                "mid-confidence proposals dropped"
+            )
+            return
+        messages.append({
+            "source": "orchestrator", "content": review_resp,
+        })
+        accepted_indices: set[int] = set()
+        for data in _find_json_objects(review_resp):
+            decisions = data.get("decisions", [])
+            if not isinstance(decisions, list):
+                continue
+            for dec in decisions:
+                if not isinstance(dec, dict):
                     continue
-
-                inst_progress = outer_progress_base + (inst_idx / len(sorted_instruments)) * outer_step * 0.8
-
-                # Get distribution guidance from main_score or update
-                dist_guidance = ""
-                if distribution_update:
-                    dist_guidance = distribution_update
-                elif main_score.instrument_plan:
-                    dist_guidance = main_score.instrument_plan.get(inst_name, "")
-
-                # Run inner loop for this instrument
-                inner_articulations = await self._run_inner_loop(
-                    inst_name=inst_name,
-                    inst_role=inst_role,
-                    inst_info=inst_info,
-                    main_score=main_score,
-                    current_score=current_score,
-                    enriched_sections=enriched_sections,
-                    arranged_instruments=arranged_instruments,
-                    key=key,
-                    scale_type=scale_type,
-                    role_mins=role_mins,
-                    inst_ranges=inst_ranges,
-                    dist_guidance=dist_guidance,
-                    grid=grid,
-                    messages=messages,
-                    snapshots=snapshots,
-                    drafts_dir=drafts_dir,
-                    safe_t=safe_t,
-                    outer_rnd=outer_rnd,
-                    progress_base=inst_progress,
+                idx = dec.get("index")
+                if not isinstance(idx, int):
+                    continue
+                if 0 <= idx < len(mid_conf) and dec.get("accept"):
+                    accepted_indices.add(idx)
+        for idx, (source, prop) in enumerate(mid_conf):
+            if idx in accepted_indices:
+                _apply_proposal_to_plan(
+                    spotlight_plan, prop, all_inst_names,
+                    source=f"{source}/reviewed",
                 )
-                articulations.update(inner_articulations)
-                arranged_instruments.append(inst_name)
-
-                # Build track_instruments entry
-                track_instruments[inst_name] = {
-                    "instrument": inst_name,
-                    "role": inst_role,
-                    "channel": 0,
-                    "program": _map_instrument_program(inst_name, 0),
-                }
-
-            # Validate channels
-            track_instruments = _validate_channels(track_instruments)
-
-            # Apply channels to score tracks
-            for trk in current_score.tracks:
-                ti = track_instruments.get(trk.instrument)
-                if ti:
-                    trk.channel = ti["channel"]
-                    trk.program = ti["program"]
-
-            # Snapshot after all instruments arranged
-            snap = str(drafts_dir / f"{safe_t}_outer{outer_rnd}_ensemble.mid")
-            save_score_midi(current_score, snap)
-            snapshots.append(snap)
-
-            # Ensemble Critic
-            ensemble_result = await self._run_ensemble_critic(
-                current_score, main_score, enriched_sections,
-                blueprint_instruments, lyrics, role_mins,
-                inst_ranges, messages,
-                outer_progress_base + outer_step * 0.9,
-            )
-
-            if ensemble_result["passes"]:
-                logger.info(f"[Outer {outer_rnd}] Ensemble Critic passed!")
-                break
-
-            # Handle selective re-runs
-            main_changes = ensemble_result.get("main_score_changes")
-            reruns = ensemble_result.get("instrument_reruns", [])
-            keeps = ensemble_result.get("keep_instruments", [])
-            distribution_update = ensemble_result.get("distribution_update", "")
-
-            if main_changes is not None and main_changes != "":
-                logger.info(f"[Outer {outer_rnd}] Main score changes requested, re-running Phase 2")
-                main_score, lyrics = await self._run_phase2_lead_sheet(
-                    enriched_sections, blueprint_instruments,
-                    key, scale_type, draft_description,
-                    orch_resp,
-                    messages, snapshots, drafts_dir, safe_t,
-                    critic_feedback=main_changes,
-                )
-                frozen_instruments.clear()
-            elif reruns:
-                frozen_instruments = {
-                    inst.get("name", "") for inst in sorted_instruments
-                    if inst.get("name", "") not in reruns
-                }
-                logger.info(f"[Outer {outer_rnd}] Re-running: {reruns}, frozen: {frozen_instruments}")
             else:
-                # No specific guidance — re-run all
-                frozen_instruments.clear()
-
-        # Merge lyrics into final score
-        if lyrics and current_score:
-            for sec in current_score.sections:
-                sec_lyrics = _get_section_lyrics(
-                    sec.name, sec.start_beat, sec.start_beat + sec.bars * bpb, lyrics,
+                logger.info(
+                    f"[spotlight] reviewer rejected {source} "
+                    f"proposal for '{prop.section}'"
                 )
-                if sec_lyrics:
-                    sec.lyrics = sec_lyrics
-
-        return current_score, articulations
-
-    # ------------------------------------------------------------------
-    # Inner Loop: Per-instrument refinement
-    # ------------------------------------------------------------------
-
-    async def _run_inner_loop(
-        self, inst_name, inst_role, inst_info,
-        main_score, current_score, enriched_sections,
-        arranged_instruments, key, scale_type,
-        role_mins, inst_ranges, dist_guidance, grid,
-        messages, snapshots, drafts_dir, safe_t,
-        outer_rnd, progress_base,
-    ) -> dict[str, list[dict]]:
-        logger.info(f"  === Inner Loop: {inst_name} ({inst_role}) ===")
-        self.composer.set_mode("instrument")
-        self.critic.set_mode("inner")
-
-        max_inner = settings.max_inner_loops
-        inner_articulations: dict[str, list[dict]] = {}
-        critic_feedback = ""
-        bpb = current_score.time_signature[0] if current_score.time_signature else 4
-
-        # Get instrument knowledge
-        inst_knowledge_text = format_for_composer(inst_name, inst_role)
-        inst_technique_text = format_for_instrumentalist(inst_name)
-
-        for inner_rnd in range(1, max_inner + 1):
-            logger.info(f"    Inner round {inner_rnd}/{max_inner} for {inst_name}")
-
-            # Remove previous attempt for this instrument
-            current_score.tracks = [
-                t for t in current_score.tracks
-                if t.instrument != inst_name
-            ]
-
-            all_notes: list[dict] = []
-
-            # Compose per section
-            for sec in enriched_sections:
-                # Build context for this instrument + section
-                main_desc = main_score.to_description(key, scale_type) if main_score.melody else ""
-
-                arranged_ctx = _format_arranged_instruments_context(
-                    current_score, arranged_instruments,
-                    sec["start_beat"] - 1.0,
-                    sec["end_beat"] - 1.0,
-                )
-
-                # Density and gap info (only for rounds > 1)
-                density_hm = ""
-                gap_rpt = ""
-                if inner_rnd > 1 and current_score.tracks:
-                    density_hm = compute_density_heatmap(current_score, bpb)
-                    gap_rpt = detect_gaps(current_score, role_mins, bpb)
-
-                overlap_ctx = build_overlap_context(
-                    current_score, sec["name"], enriched_sections,
-                    track_name=inst_name.lower(), beats_per_bar=bpb,
-                )
-
-                section_prompt = build_inner_composer_prompt(
-                    instrument_name=inst_name,
-                    instrument_role=inst_role,
-                    section_name=sec["name"],
-                    start_beat=sec["start_beat"],
-                    end_beat=sec["end_beat"],
-                    bars=sec["bars"],
-                    mood=sec.get("mood", ""),
-                    key=key,
-                    scale_type=scale_type,
-                    main_score_description=main_desc,
-                    arranged_instruments_context=arranged_ctx,
-                    density_heatmap=density_hm,
-                    gap_report=gap_rpt,
-                    overlap_context=overlap_ctx,
-                    instrument_knowledge=inst_knowledge_text or "",
-                    critic_feedback=critic_feedback if sec == enriched_sections[0] else "",
-                    distribution_guidance=dist_guidance,
-                )
-
-                comp_resp = await self._call_agent(self.composer, messages, section_prompt)
-                messages.append({"source": "composer", "content": comp_resp})
-
-                for data in _find_json_objects(comp_resp):
-                    candidate = _extract_tracks_from_json(data)
-                    if candidate:
-                        for trk_name, notes in candidate.items():
-                            notes = _quantize_notes(notes, grid)
-                            notes = _clamp_to_section(notes, sec["start_beat"], sec["end_beat"])
-                            notes = _clamp_pitch_range(notes, inst_name)
-                            all_notes.extend(notes)
-                        break
-
-            if not all_notes:
-                logger.warning(f"    [{inst_name}] No notes produced in inner round {inner_rnd}")
-                continue
-
-            # Build ScoreTrack and add to score
-            # Adjust beats from 1-indexed to 0-indexed
-            adjusted_notes = [
-                ScoreNote(
-                    pitch=n["pitch"],
-                    start_beat=n["start_beat"] - 1.0,
-                    duration_beats=n["duration_beats"],
-                    velocity=n["velocity"],
-                )
-                for n in all_notes
-            ]
-            adjusted_notes.sort(key=lambda n: n.start_beat)
-
-            program = _map_instrument_program(inst_name, 0)
-            new_track = ScoreTrack(
-                name=inst_name.lower(),
-                instrument=inst_name,
-                role=inst_role,
-                program=program,
-                notes=adjusted_notes,
-            )
-            current_score.tracks.append(new_track)
-            logger.info(f"    [{inst_name}] {len(adjusted_notes)} notes added")
-
-            # Snapshot
-            snap = str(drafts_dir / f"{safe_t}_outer{outer_rnd}_inner{inner_rnd}_{inst_name.lower()}.mid")
-            save_score_midi(current_score, snap)
-            snapshots.append(snap)
-
-            # Instrumentalist: articulations for this instrument
-            if self._on_progress:
-                await self._on_progress(
-                    "instrumentalist",
-                    f"Articulations for {inst_name}",
-                    progress_base + 0.02,
-                )
-
-            inst_ctx = ""
-            if inst_technique_text:
-                inst_ctx += f"TECHNIQUE GUIDE for {inst_name}:\n{inst_technique_text}\n\n"
-            inst_ctx += f"Score summary:\n{current_score.to_llm_description()}\n\n"
-            inst_ctx += f"Assign articulations for {inst_name} ONLY."
-
-            inst_resp = await self._call_agent(self.instrumentalist, messages, inst_ctx)
-            messages.append({"source": "instrumentalist", "content": inst_resp})
-
-            for data in _find_json_objects(inst_resp):
-                for trk in data.get("tracks", []):
-                    if not isinstance(trk, dict):
-                        continue
-                    arts = trk.get("articulations", [])
-                    if isinstance(arts, list) and arts:
-                        inner_articulations[inst_name] = arts
-
-            # Inner Critic
-            if self._on_progress:
-                await self._on_progress(
-                    "critic",
-                    f"Reviewing {inst_name} (inner {inner_rnd})",
-                    progress_base + 0.04,
-                )
-
-            density_hm = compute_density_heatmap(current_score, bpb)
-            gap_rpt = detect_gaps(current_score, role_mins, bpb)
-            register_cov = compute_register_coverage(current_score, inst_ranges)
-
-            critic_ctx = f"Evaluating {inst_name} ({inst_role}).\n\n"
-            critic_ctx += f"{density_hm}\n\n"
-            if gap_rpt:
-                critic_ctx += f"{gap_rpt}\n\n"
-            critic_ctx += f"{register_cov}\n\n"
-            if main_score.melody:
-                critic_ctx += f"Main score reference:\n{main_score.to_description(key, scale_type)[:800]}\n\n"
-            critic_ctx += f"Score summary:\n{current_score.to_llm_description()}\n\n"
-            critic_ctx += f"Evaluate {inst_name}'s part. Check density, fit, and idiom."
-
-            crit_resp = await self._call_agent(self.critic, messages, critic_ctx)
-            messages.append({"source": "critic", "content": crit_resp})
-
-            passes = False
-            for data in _find_json_objects(crit_resp):
-                passes = data.get("passes", False)
-                critic_feedback = data.get("revision_instructions", "")
-                score_val = data.get("overall_score", 0)
-                logger.info(f"    [{inst_name}] Inner Critic score={score_val}, passes={passes}")
-
-            if passes:
-                logger.info(f"    [{inst_name}] Inner Critic passed at round {inner_rnd}")
-                break
-
-        return inner_articulations
-
-    # ------------------------------------------------------------------
-    # Ensemble Critic
-    # ------------------------------------------------------------------
-
-    async def _run_ensemble_critic(
-        self, current_score, main_score, enriched_sections,
-        blueprint_instruments, lyrics, role_mins, inst_ranges,
-        messages, progress,
-    ) -> dict:
-        logger.info("  === Ensemble Critic ===")
-        self.critic.set_mode("ensemble")
-
-        if self._on_progress:
-            await self._on_progress("critic", "Ensemble review", progress)
-
-        bpb = current_score.time_signature[0] if current_score.time_signature else 4
-
-        density_hm = compute_density_heatmap(current_score, bpb)
-        gap_rpt = detect_gaps(current_score, role_mins, bpb)
-        register_cov = compute_register_coverage(current_score, inst_ranges)
-        # Convert to 0-indexed for compute_score_metrics (score notes are 0-indexed)
-        enriched_0 = [
-            {**sec, "start_beat": sec["start_beat"] - 1.0, "end_beat": sec["end_beat"] - 1.0}
-            for sec in enriched_sections
-        ]
-        metrics = compute_score_metrics(current_score, enriched_0, lyrics)
-        metrics_text = format_metrics_for_critic(metrics)
-
-        inst_criteria = _build_critic_criteria(blueprint_instruments)
-
-        critic_ctx = "ENSEMBLE REVIEW — evaluate all instruments together.\n\n"
-        critic_ctx += f"{metrics_text}\n\n"
-        critic_ctx += f"{density_hm}\n\n"
-        if gap_rpt:
-            critic_ctx += f"{gap_rpt}\n\n"
-        critic_ctx += f"{register_cov}\n\n"
-        if inst_criteria:
-            critic_ctx += "INSTRUMENT CRITERIA:\n" + "\n".join(inst_criteria) + "\n\n"
-        critic_ctx += f"Score:\n{current_score.to_llm_description()}\n\n"
-        if main_score.melody:
-            critic_ctx += f"Lead sheet:\n{main_score.to_description()[:600]}\n\n"
-        critic_ctx += (
-            "Evaluate the ensemble. Output main_score_changes (null if melody is fine), "
-            "instrument_reruns (list of instruments to re-arrange), "
-            "keep_instruments (list of satisfactory instruments)."
-        )
-
-        crit_resp = await self._call_agent(self.critic, messages, critic_ctx)
-        messages.append({"source": "critic", "content": crit_resp})
-
-        result = {
-            "passes": False,
-            "main_score_changes": None,
-            "instrument_reruns": [],
-            "keep_instruments": [],
-            "distribution_update": "",
-        }
-
-        for data in _find_json_objects(crit_resp):
-            result["passes"] = data.get("passes", False)
-            result["main_score_changes"] = data.get("main_score_changes")
-            result["instrument_reruns"] = data.get("instrument_reruns", [])
-            result["keep_instruments"] = data.get("keep_instruments", [])
-            result["distribution_update"] = data.get("distribution_update", "")
-            score_val = data.get("overall_score", 0)
-            logger.info(
-                f"  Ensemble Critic score={score_val}, passes={result['passes']}, "
-                f"reruns={result['instrument_reruns']}"
-            )
-
-        return result
 
     async def _call_agent(
         self, agent, history: list[dict], user_content: str,
