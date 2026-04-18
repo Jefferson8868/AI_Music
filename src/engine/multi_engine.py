@@ -32,6 +32,7 @@ from src.engine.interface import (
     GenerationResult,
     MusicEngineInterface,
 )
+from src.engine.null_engine import NullEngine
 
 
 class MultiEngine(MusicEngineInterface):
@@ -119,9 +120,27 @@ class MultiEngine(MusicEngineInterface):
         return self._pick(await self._fanout("generate_polyphony", request))
 
     async def health_check(self) -> bool:
-        """Healthy if ANY underlying engine is healthy."""
+        """Healthy if any *real* engine (not NullEngine) reports healthy.
+
+        NullEngine always returns notes=[]; if we counted it as healthy,
+        MultiEngine would look "up" even when Magenta is down — leading to
+        instant 0-note generations and confusing logs.
+        """
+
+        async def _real_engine_ok(eng: MusicEngineInterface) -> bool:
+            if isinstance(eng, NullEngine):
+                return False
+            try:
+                return await eng.health_check()
+            except Exception as exc:
+                logger.debug(
+                    f"[MultiEngine] health_check on "
+                    f"{type(eng).__name__}: {exc}"
+                )
+                return False
+
         results = await asyncio.gather(
-            *(e.health_check() for e in self.engines),
+            *(_real_engine_ok(e) for e in self.engines),
             return_exceptions=True,
         )
         return any(r is True for r in results)

@@ -105,6 +105,15 @@ class SynthesizerAgent(BaseChatAgent):
             ))
             logger.info(f"[Synthesizer] polyphony done in {time.time()-t1:.1f}s — {len(poly_result.notes)} notes")
 
+            if not melody_result.notes and not poly_result.notes:
+                logger.warning(
+                    "[Synthesizer] Draft generation returned 0 melody and 0 polyphony notes. "
+                    "Start the Magenta microservice (default url from settings.magenta_url / "
+                    "MG_MAGENTA_URL, e.g. http://localhost:8001), or set MG_REFERENCE_ENGINES=magenta "
+                    "to avoid mixing in NullEngines that mask a dead backend. "
+                    "Phase 2 can still compose without a Magenta draft."
+                )
+
             score = self._build_draft_score(melody_result, poly_result, params)
             score_json = score.model_dump_json(indent=2)
 
