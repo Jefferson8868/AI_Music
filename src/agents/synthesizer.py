@@ -15,15 +15,31 @@ from autogen_agentchat.messages import BaseChatMessage, TextMessage
 from autogen_core import CancellationToken
 from loguru import logger
 
+from config.settings import settings
+from src.engine.factory import create_engine
 from src.engine.interface import GenerationRequest, GenerationResult
-from src.engine.magenta_engine import create_engine
 from src.music.score import Score, ScoreNote, ScoreTrack, ScoreSection
 
 
 class SynthesizerAgent(BaseChatAgent):
-    def __init__(self, name: str, description: str = "Calls Magenta to generate draft scores from primer notes"):
+    def __init__(
+        self,
+        name: str,
+        description: str = (
+            "Calls music engine(s) to generate draft scores from primer "
+            "notes. When settings.reference_engines lists multiple engines "
+            "(e.g. 'magenta,composers_assistant,mmt'), builds a MultiEngine "
+            "with strategy='merge' so the Composer sees alternative drafts."
+        ),
+        reference_engines: str | None = None,
+    ):
         super().__init__(name=name, description=description)
-        self._engine = create_engine()
+        spec = reference_engines or settings.reference_engines or settings.music_engine
+        # Round 2 Phase A: merge strategy tags each note with its source
+        # engine label so downstream code (pipeline → Composer prompt) can
+        # surface alternative drafts as reference perspectives.
+        self._engine = create_engine(spec, strategy="merge")
+        self._engine_spec = spec
         self._failed = False
         self._fail_count = 0
 
@@ -92,12 +108,50 @@ class SynthesizerAgent(BaseChatAgent):
             score = self._build_draft_score(melody_result, poly_result, params)
             score_json = score.model_dump_json(indent=2)
 
+            # Count per-engine contributions (MultiEngine merge tags each
+            # note dict with a `source` key). Useful for both operators and
+            # for the Composer prompt block.
+            combined_notes = melody_result.notes + poly_result.notes
+            per_engine = _count_per_engine_notes(combined_notes)
+            per_engine_str = ", ".join(
+                f"{label}={n}" for label, n in per_engine.items()
+            ) or "single engine"
+
+            # Round 2 Phase A: embed a machine-readable per-engine split
+            # so the pipeline can hand the Composer alternative drafts
+            # as `draft_perspectives`. Cap at 64 notes per engine to
+            # keep the agent message well under 10KB.
+            perspectives = split_notes_by_engine(combined_notes)
+            perspectives_payload = {
+                "draft_perspectives": {
+                    label: [
+                        {
+                            "pitch": int(n.get("pitch", 60)),
+                            "start_time": float(n.get("start_time", 0.0)),
+                            "end_time": float(n.get("end_time", 0.0)),
+                            "velocity": int(n.get("velocity", 80)),
+                            "source": str(
+                                n.get("source") or label,
+                            ),
+                        }
+                        for n in notes[:64]
+                    ]
+                    for label, notes in perspectives.items()
+                },
+                "engine_spec": self._engine_spec,
+                "qpm": float(params.get("qpm", 120.0)),
+            }
+
             output = (
-                f"[Synthesizer] Draft score generated via Magenta.\n"
+                f"[Synthesizer] Draft score generated via "
+                f"{self._engine_spec} (per-engine notes: "
+                f"{per_engine_str}).\n"
                 f"Melody: {len(melody_result.notes)} notes, "
                 f"Polyphony: {len(poly_result.notes)} notes\n\n"
                 f"Score summary:\n{score.to_summary()}\n\n"
-                f"```json\n{score_json}\n```"
+                f"```json\n{score_json}\n```\n\n"
+                f"Reference-draft perspectives (per engine):\n"
+                f"```json\n{json.dumps(perspectives_payload, indent=2)}\n```"
             )
             return Response(chat_message=TextMessage(content=output, source=self.name))
 
@@ -183,3 +237,27 @@ class SynthesizerAgent(BaseChatAgent):
                 ScoreTrack(name="harmony", instrument="piano", role="accompaniment", channel=1, program=0, notes=poly_notes),
             ],
         )
+
+
+def _count_per_engine_notes(notes: list[dict]) -> dict[str, int]:
+    """Count how many notes each engine contributed (by `source` tag)."""
+    counts: dict[str, int] = {}
+    for n in notes:
+        label = str(n.get("source") or "unknown")
+        counts[label] = counts.get(label, 0) + 1
+    return counts
+
+
+def split_notes_by_engine(notes: list[dict]) -> dict[str, list[dict]]:
+    """Split a merged note list back into per-engine draft perspectives.
+
+    Used by pipeline.py to build the `draft_perspectives` parameter for
+    `build_composer_section_prompt()` — one compact summary line per
+    engine, for the Composer to compare/contrast ideas without being
+    told to copy any of them.
+    """
+    buckets: dict[str, list[dict]] = {}
+    for n in notes:
+        label = str(n.get("source") or "unknown")
+        buckets.setdefault(label, []).append(n)
+    return buckets

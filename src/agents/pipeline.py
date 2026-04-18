@@ -31,6 +31,10 @@ from src.agents.lyricist import LyricistAgent
 from src.agents.instrumentalist import InstrumentalistAgent
 from src.agents.critic import CriticAgent
 from src.agents.synthesizer import SynthesizerAgent
+# Round 2 Phase B: rule-based rhythm / bass / transition agents.
+from src.agents.drum_agent import DrumAgent
+from src.agents.bass_agent import BassAgent, extract_kick_positions
+from src.agents.transition_agent import TransitionAgent
 from src.llm.client import create_llm_client
 from src.llm.prompts import (
     build_composer_section_prompt,
@@ -62,6 +66,11 @@ from src.music.score import (
     Score, ScoreNote, ScoreSection, ScoreTrack,
     SpotlightEntry, SpotlightProposal,
     compute_score_metrics, format_metrics_for_critic,
+)
+from src.music.lyrics_alignment import (
+    analyze_lyrics,
+    format_density_plan_for_lyricist,
+    format_lyrics_feedback_for_lyricist,
 )
 from src.music.midi_writer import save_score_midi
 from config.settings import settings
@@ -1154,6 +1163,11 @@ class MusicGenerationPipeline:
             name="critic", model_client=self._llm_client,
         )
         self.synthesizer = SynthesizerAgent(name="synthesizer")
+        # Round 2 Phase B: rule-based agents (no LLM). Constructed once,
+        # reused across sections.
+        self.drum_agent = DrumAgent()
+        self.bass_agent = BassAgent()
+        self.transition_agent = TransitionAgent()
 
     async def run(self, request: MusicRequest) -> PipelineResult:
         task_text = self._build_task(request)
@@ -1289,6 +1303,27 @@ class MusicGenerationPipeline:
                     "[Phase1] No usable score from Magenta"
                 )
 
+            # Round 2 Phase A: multi-engine reference fanout.
+            # The Synthesizer embeds a per-engine note split as a
+            # `draft_perspectives` JSON block so the Composer can see
+            # alternative drafts (Composer's Assistant 2 / MMT / FIGARO)
+            # without having to copy any of them verbatim.
+            draft_perspectives: dict[str, list[dict]] = {}
+            for data in _find_json_objects(synth_resp):
+                dp = data.get("draft_perspectives")
+                if isinstance(dp, dict) and dp:
+                    for label, notes in dp.items():
+                        if isinstance(notes, list) and notes:
+                            draft_perspectives[str(label)] = list(notes)
+                    break
+            if draft_perspectives:
+                labels = ", ".join(
+                    f"{k}({len(v)})" for k, v in draft_perspectives.items()
+                )
+                logger.info(
+                    f"[Phase1] Reference-engine drafts collected: {labels}"
+                )
+
             # ---- Phase 2: Collaborative Refinement Loop ----
             logger.info("=== Phase 2: Collaborative Refinement ===")
             max_rounds = settings.max_refinement_rounds
@@ -1296,6 +1331,10 @@ class MusicGenerationPipeline:
             # the structured CriticRound carries per-section / per-agent
             # routing (Improvement E).
             critic_feedback = ""
+            # Articulations survive the Phase 2 loop so that the final MIDI
+            # writer below always has something well-typed to consume, even
+            # if max_rounds==0 or the instrumentalist round is skipped.
+            articulations: dict[str, list[dict]] = {}
             critic_round_current: CriticRound | None = None
             critic_round_previous: CriticRound | None = None
             # Plateau detection: remember overall_score history.
@@ -1429,6 +1468,12 @@ class MusicGenerationPipeline:
                         ornament_vocabulary=ornament_vocab,
                         continuity_profiles=continuity_profiles,
                         theory_hints=sec_theory_hints,
+                        # Round 2 Phase A: only inject on round 1 to keep
+                        # later-round prompts compact. Multi-engine drafts
+                        # are inspiration material, not course correction.
+                        draft_perspectives=(
+                            draft_perspectives if rnd == 1 else None
+                        ),
                     )
 
                     comp_resp = await self._call_agent(
@@ -1570,6 +1615,36 @@ class MusicGenerationPipeline:
                         )[:1500]
                         + "\n\n"
                     )
+
+                # Improvement F: density plan (always) + per-round
+                # feedback report (when we have previous lyrics + a
+                # current score to analyze against).
+                density_plan_text = format_density_plan_for_lyricist(
+                    enriched_sections,
+                )
+                if density_plan_text:
+                    lyricist_context += density_plan_text + "\n\n"
+
+                lyrics_report = None
+                if lyrics and current_score:
+                    try:
+                        lyrics_report = analyze_lyrics(
+                            current_score, lyrics, enriched_sections,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "Lyrics analysis failed: %s", exc,
+                        )
+                        lyrics_report = None
+                if lyrics_report and lyrics_report.sections:
+                    feedback_text = (
+                        format_lyrics_feedback_for_lyricist(
+                            lyrics_report,
+                        )
+                    )
+                    if feedback_text:
+                        lyricist_context += feedback_text + "\n\n"
+
                 lyr_feedback = ""
                 if critic_round_current is not None:
                     lyr_feedback = (
@@ -1587,7 +1662,11 @@ class MusicGenerationPipeline:
                     )
                 lyricist_context += (
                     "Write or revise lyrics. "
-                    "Place each lyric ONLY on melody note beats."
+                    "Place each lyric ONLY on melody note beats. "
+                    "Respect the density plan above. For Chinese "
+                    "lyrics, prefer characters whose tone matches the "
+                    "melody contour at that beat (rising tone on "
+                    "rising melody, falling tone on falling melody)."
                 )
 
                 lyr_resp = await self._call_agent(
@@ -1831,6 +1910,30 @@ class MusicGenerationPipeline:
                         )[:1500]
                         + "\n\n"
                     )
+                    # Improvement F: surface the SAME lyrics report to
+                    # the critic so the lyrics_alignment + tone_conflict
+                    # numbers actually drive the critique instead of
+                    # being private to the Lyricist.
+                    if current_score:
+                        try:
+                            crit_lyrics_report = analyze_lyrics(
+                                current_score, lyrics,
+                                enriched_sections,
+                            )
+                        except Exception as exc:
+                            logger.warning(
+                                "Lyrics analysis for critic failed: %s",
+                                exc,
+                            )
+                            crit_lyrics_report = None
+                        if (
+                            crit_lyrics_report
+                            and crit_lyrics_report.sections
+                        ):
+                            critic_context += (
+                                crit_lyrics_report.to_prompt_block()
+                                + "\n\n"
+                            )
 
                 critic_context += (
                     "\nCURRENT SPOTLIGHT PLAN "
@@ -2027,6 +2130,25 @@ class MusicGenerationPipeline:
             )
             if not final_score:
                 final_score = current_score
+
+            # ---- Phase 3.5: DrumAgent + BassAgent + TransitionAgent ----
+            # Augment the final score with song-feel machinery:
+            #   * DrumAgent writes a groove-templated drum kit per section
+            #     where the spotlight plan marks drums as active.
+            #   * BassAgent writes a bass line locked to the drum kicks.
+            #   * TransitionAgent scans section boundaries and plans
+            #     one ear-candy recipe per boundary.
+            try:
+                self._augment_with_drum_bass_transition(
+                    final_score, spotlight_plan, enriched_sections,
+                    request=request, tempo=tempo, key=key,
+                    scale_type=scale_type,
+                )
+            except Exception as e:
+                logger.warning(
+                    f"[Phase3.5] Drum/Bass/Transition augmentation "
+                    f"failed: {e}"
+                )
 
             # ---- Phase 4: Performance render ----
             # Ornament macros -> pitch-bend / CC / note retrigger events.
@@ -2226,6 +2348,221 @@ class MusicGenerationPipeline:
 
     async def close(self) -> None:
         await self.synthesizer.close()
+
+    # ------------------------------------------------------------------
+    # Phase 3.5 — Rule-based drum / bass / transition augmentation
+    # ------------------------------------------------------------------
+
+    def _augment_with_drum_bass_transition(
+        self,
+        final_score: Score,
+        spotlight_plan: list[SpotlightEntry],
+        enriched_sections: list[dict],
+        request: MusicRequest,
+        tempo: int,
+        key: str,
+        scale_type: str,
+    ) -> None:
+        """Inject song-feel machinery into the final score.
+
+        Rule-based agents (DrumAgent, BassAgent, TransitionAgent) run
+        AFTER the LLM composition rounds converge. They:
+
+          1. Walk each enriched section and check the spotlight plan.
+          2. If 'drums' is active → call DrumAgent.compose_section and
+             merge the resulting ScoreTracks (drums_kick, drums_snare,
+             drums_chh, drums_ohh, drums_crash, drums_perc, drums_fill)
+             by voice across sections.
+          3. If 'bass' is active → call BassAgent.compose_section with
+             the kick positions from step 2.
+          4. Any pre-existing LLM-authored drum / bass track is
+             REMOVED first — the approved plan is explicit that
+             modern pop should use a deterministic groove, not a
+             per-note LLM drum part.
+          5. After all sections are processed, TransitionAgent scans
+             section boundaries and emits one ear-candy recipe per
+             boundary (riser / reverse cymbal / impact / sub-drop /
+             snare roll / kick drop / crash).
+
+        Idempotent by virtue of the TransitionAgent's own guard
+        (returns the existing list if transition_events is non-empty).
+        """
+        import re as _re
+
+        # -- Parse the key -> bass-register MIDI root. --
+        key_token = (key or "C").strip().split()[0]
+        m = _re.match(r"([A-G][b#]?)", key_token)
+        base_name = m.group(1) if m else "C"
+        # Root at octave 4 (middle-ish), then drop two octaves for bass.
+        root_mid = _NOTE_TO_MIDI.get(f"{base_name}4", 60)
+        bass_root_midi = max(24, root_mid - 24)
+
+        # -- Index spotlight entries by lower-case section name. --
+        spotlight_by_section = {
+            e.section.lower(): e for e in spotlight_plan
+        }
+
+        # Token sets for matching instrument names.
+        _DRUM_TOKENS = {
+            "drums", "drum", "drum kit", "percussion", "perc",
+        }
+        _BASS_TOKENS = {
+            "bass", "electric bass", "bass guitar", "synth bass",
+            "e-bass", "upright bass", "acoustic bass",
+        }
+        _KNOWN_ROLES = {
+            "intro", "verse", "pre_chorus",
+            "chorus", "bridge", "outro",
+        }
+
+        # -- Decide up front whether we'll emit any drum / bass track. --
+        any_drum = False
+        any_bass = False
+        for sec in enriched_sections:
+            entry = spotlight_by_section.get(sec["name"].lower())
+            if entry is None:
+                continue
+            active_lower = {a.lower() for a in entry.active}
+            if active_lower & _DRUM_TOKENS:
+                any_drum = True
+            if active_lower & _BASS_TOKENS:
+                any_bass = True
+            if any_drum and any_bass:
+                break
+
+        # -- Strip any pre-existing LLM-authored drum / bass tracks. --
+        #    The rule-based groove is the canonical one from here on.
+        if any_drum or any_bass:
+            kept: list[ScoreTrack] = []
+            removed = 0
+            for t in final_score.tracks:
+                name_l = (t.name or "").lower()
+                inst_l = (t.instrument or "").lower()
+                role_l = (t.role or "").lower()
+                is_drum_tok = any(tok in name_l for tok in _DRUM_TOKENS) \
+                    or any(tok in inst_l for tok in _DRUM_TOKENS) \
+                    or role_l == "rhythm"
+                is_bass_tok = (
+                    name_l in _BASS_TOKENS
+                    or inst_l in _BASS_TOKENS
+                    or role_l == "bass"
+                )
+                if (any_drum and is_drum_tok) or (any_bass and is_bass_tok):
+                    removed += 1
+                    continue
+                kept.append(t)
+            if removed:
+                logger.info(
+                    f"[Phase3.5] Replaced {removed} LLM-authored "
+                    "drum/bass track(s) with rule-based groove"
+                )
+            final_score.tracks = kept
+
+        # -- Per-voice merged drum tracks + a single merged bass track. --
+        merged_drum: dict[str, ScoreTrack] = {}
+        merged_bass: ScoreTrack | None = None
+        drum_sections = 0
+        bass_sections = 0
+        genre_hint = (request.genre or "").strip()
+
+        for sec in enriched_sections:
+            sec_name = sec["name"]
+            bars = int(sec.get("bars", 4))
+            # Score uses 0-indexed beats; enriched_sections is 1-indexed.
+            start_beat_s = sec["start_beat"] - 1.0
+            end_beat_s = sec["end_beat"] - 1.0
+            entry = spotlight_by_section.get(sec_name.lower())
+            if entry is None:
+                continue
+            active_lower = {a.lower() for a in entry.active}
+            wants_drums = bool(active_lower & _DRUM_TOKENS)
+            wants_bass = bool(active_lower & _BASS_TOKENS)
+            if not (wants_drums or wants_bass):
+                continue
+
+            # Resolve section_role from the blueprint name.
+            role_candidate = sec.get("role") or sec_name
+            role_key = str(role_candidate).lower().replace(" ", "_")
+            section_role = (
+                role_key if role_key in _KNOWN_ROLES else "verse"
+            )
+
+            drum_tracks: list[ScoreTrack] = []
+            if wants_drums:
+                try:
+                    drum_tracks = self.drum_agent.compose_section(
+                        section_role=section_role,  # type: ignore[arg-type]
+                        start_beat=start_beat_s,
+                        end_beat=end_beat_s,
+                        bars=bars,
+                        tempo_bpm=float(tempo),
+                        genre_hint=genre_hint,
+                    )
+                    for trk in drum_tracks:
+                        prev = merged_drum.get(trk.name)
+                        if prev is None:
+                            merged_drum[trk.name] = trk
+                        else:
+                            prev.notes.extend(trk.notes)
+                    drum_sections += 1
+                except Exception as exc:
+                    logger.warning(
+                        f"[Phase3.5] DrumAgent failed on "
+                        f"section='{sec_name}': {exc}"
+                    )
+                    drum_tracks = []
+
+            if wants_bass:
+                try:
+                    kick_positions = extract_kick_positions(drum_tracks)
+                    bass_track = self.bass_agent.compose_section(
+                        section_role=section_role,
+                        start_beat=start_beat_s,
+                        end_beat=end_beat_s,
+                        bars=bars,
+                        key_root_midi=bass_root_midi,
+                        scale_type=scale_type,
+                        kick_positions=(
+                            kick_positions if kick_positions else None
+                        ),
+                    )
+                    if merged_bass is None:
+                        merged_bass = bass_track
+                    else:
+                        merged_bass.notes.extend(bass_track.notes)
+                    bass_sections += 1
+                except Exception as exc:
+                    logger.warning(
+                        f"[Phase3.5] BassAgent failed on "
+                        f"section='{sec_name}': {exc}"
+                    )
+
+        # -- Sort every merged track's notes and append to final_score. --
+        for trk in merged_drum.values():
+            trk.notes.sort(key=lambda n: n.start_beat)
+            final_score.tracks.append(trk)
+        if merged_bass is not None:
+            merged_bass.notes.sort(key=lambda n: n.start_beat)
+            final_score.tracks.append(merged_bass)
+
+        logger.info(
+            f"[Phase3.5] DrumAgent: {drum_sections} section(s), "
+            f"{len(merged_drum)} voice track(s); "
+            f"BassAgent: {bass_sections} section(s), "
+            f"{0 if merged_bass is None else len(merged_bass.notes)} note(s)"
+        )
+
+        # -- Plan section-boundary ear-candy. --
+        try:
+            self.transition_agent.attach(final_score)
+            logger.info(
+                f"[Phase3.5] TransitionAgent attached "
+                f"{len(final_score.transition_events)} event(s)"
+            )
+        except Exception as exc:
+            logger.warning(
+                f"[Phase3.5] TransitionAgent failed: {exc}"
+            )
 
     def _build_task(self, request: MusicRequest) -> str:
         parts = ["Create music based on this request:"]

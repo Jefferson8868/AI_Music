@@ -20,6 +20,13 @@ class Settings(BaseSettings):
     music_engine: str = "magenta"  # magenta | musiclang | midi_llm
     magenta_url: str = "http://localhost:8001"
 
+    # Round 2 Phase A: Multi-engine reference fanout.
+    # Comma-separated list (or "multi:..." prefix). When more than one
+    # engine is listed, Phase 1 builds a MultiEngine(strategy="merge")
+    # so the Composer sees alternative drafts as reference perspectives.
+    # Unavailable engines degrade to NullEngine silently.
+    reference_engines: str = "magenta"
+
     # Music defaults
     default_tempo: int = 120
     default_time_signature: tuple[int, int] = (4, 4)

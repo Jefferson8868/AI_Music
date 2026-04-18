@@ -88,6 +88,73 @@ but you should ALWAYS include one tailored to the requested style."""
 
 # --- Composer: per-section template ---
 
+
+def _summarize_draft_notes(
+    notes: list[dict],
+    *,
+    start_beat: float | None = None,
+    end_beat: float | None = None,
+    max_notes: int = 16,
+) -> str:
+    """Render a short 'reference draft' summary line for the Composer.
+
+    Takes the first `max_notes` notes of a draft (optionally filtered to
+    the section's beat range) and emits a compact string like:
+        "C4 E4 G4 A4 C5 … rhythm: x - x - x x - x (8 beats)"
+    which is small enough to paste into a prompt without blowing the
+    token budget but dense enough to actually inspire the Composer.
+    """
+    if not notes:
+        return ""
+
+    def _midi_to_name(p: int) -> str:
+        names = [
+            "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B",
+        ]
+        octv = (int(p) // 12) - 1
+        return f"{names[int(p) % 12]}{octv}"
+
+    # Notes from MultiEngine.merge carry start_time (seconds). If a beat
+    # range was provided we do a loose filter on section position: we
+    # don't have tempo here, but draft notes are usually already cropped
+    # to the section by the caller. So just take the first `max_notes`.
+    _ = (start_beat, end_beat)  # reserved for future beat-range filters
+
+    pitches = []
+    for n in notes[:max_notes]:
+        p = n.get("pitch")
+        if p is None:
+            continue
+        try:
+            pitches.append(_midi_to_name(int(p)))
+        except (TypeError, ValueError):
+            continue
+
+    if not pitches:
+        return ""
+
+    # Crude rhythm string based on IOI spacing of the first ~max_notes.
+    onsets = sorted(float(n.get("start_time", 0.0)) for n in notes[:max_notes])
+    if len(onsets) >= 2:
+        iois = [b - a for a, b in zip(onsets, onsets[1:])]
+        median = sorted(iois)[len(iois) // 2] or 0.25
+        cells = ["x"]
+        for ioi in iois:
+            # Each unit of median = "x"; rests shown as "-".
+            cells.append("x" if ioi <= median * 1.5 else "- x")
+        rhythm = " ".join(cells)
+    else:
+        rhythm = "x"
+
+    duration = onsets[-1] - onsets[0] if len(onsets) >= 2 else 0.0
+    return (
+        f"{' '.join(pitches)}"
+        f"{' …' if len(notes) > max_notes else ''} | "
+        f"rhythm: {rhythm} ({duration:.1f}s span, "
+        f"{len(notes)} notes total)"
+    )
+
+
 _SECTION_RULES = {
     "intro": (
         "INTRO: sparse, solo melody. 1-2 notes per bar. "
@@ -130,6 +197,7 @@ def build_composer_section_prompt(
     ornament_vocabulary: list[str] | None = None,
     continuity_profiles: dict[str, dict] | None = None,
     theory_hints: list[str] | None = None,
+    draft_perspectives: dict[str, list[dict]] | None = None,
 ) -> str:
     """Build a focused prompt for composing ONE section.
 
@@ -144,6 +212,13 @@ def build_composer_section_prompt(
             phrase_grouping_hint). Surfaced as an explicit CONTINUITY RULES
             block so SUPPORTING tracks can't drift into note-per-bar
             patterns just because they're not FEATURED.
+        draft_perspectives: mapping of reference-engine label → list of
+            note dicts from that engine's draft. Injected as a compact
+            "REFERENCE DRAFTS" block so the Composer can see what
+            Composer's Assistant 2 / MMT / FIGARO / etc. came up with for
+            this section — without being instructed to copy any of them
+            verbatim. Note dicts follow the Synthesizer shape (pitch,
+            start_time, end_time, velocity, source).
     """
     # Filter the blueprint's instrument list by active_instruments.
     if active_instruments is None:
@@ -372,6 +447,26 @@ def build_composer_section_prompt(
         parts.append("Magenta draft reference:")
         parts.append(draft_description[:800])
 
+    if draft_perspectives:
+        parts.append("")
+        parts.append(
+            "REFERENCE DRAFTS (for inspiration — DO NOT copy verbatim):"
+        )
+        for label, notes in draft_perspectives.items():
+            if not notes:
+                continue
+            summary = _summarize_draft_notes(
+                notes, start_beat=start_beat, end_beat=end_beat,
+            )
+            if summary:
+                parts.append(f"  [{label}] {summary}")
+        parts.append(
+            "Pick the best IDEAS from these drafts — or diverge "
+            "deliberately — but DO NOT copy one verbatim. Each engine "
+            "has its own bias; disagreement between engines is a "
+            "signal that this section has multiple valid directions."
+        )
+
     if critic_feedback:
         parts.append("")
         parts.append("Critic feedback to address:")
@@ -554,6 +649,8 @@ Output JSON:
     "section_contrast": 0.5,
     "instrument_idiom": 0.5,
     "ensemble_spotlight": 0.5,
+    "rhythmic_spine": 0.5,
+    "transition_quality": 0.5,
     "continuity": 0.5,
     "lyrics_quality": 0.6,
     "lyrics_alignment": 0.5
@@ -588,10 +685,12 @@ Scoring weights (use these when computing overall_score):
   melodic_contour     : 0.10
   harmonic_quality    : 0.15
   rhythmic_interest   : 0.10
-  arrangement         : 0.10
+  arrangement         : 0.05
   section_contrast    : 0.10
   instrument_idiom    : 0.15
   ensemble_spotlight  : 0.10
+  rhythmic_spine      : 0.05
+  transition_quality  : 0.05
   continuity          : 0.10
   lyrics_quality      : 0.05
   lyrics_alignment    : 0.05
@@ -630,6 +729,35 @@ plays through every section?
 section with equal density.
 - Emit spotlight_proposals (with confidence) to move instruments in \
 or out of specific sections — the Orchestrator reviews these.
+
+RHYTHMIC_SPINE CHECK (Round-2 addition):
+- Modern pop songs are BUILT on a kick/snare/hat groove + a bass \
+that LOCKS TO THE KICK, not on harmonic development alone.
+- Does the drum pattern audibly differ between verse (sparse) and \
+chorus (full kit)? Do section boundaries carry a 1-bar fill?
+- Does the bass sit on kick positions (groove) or plop one root \
+note per bar (lifeless)?
+- Are drum timestamps on a dead-straight 16th grid, or do they \
+show humanized swing + per-voice micro-timing (snare laid back, \
+hats pushed early)?
+- Score rhythmic_spine LOW if the piece would work equally well \
+as a solo-piano score — that means the rhythm section has nothing \
+to say. Score HIGH when the drums + bass together can carry the \
+piece even with the melody muted.
+
+TRANSITION_QUALITY CHECK (Round-2 addition):
+- Professional pop production signals every section change with \
+1-2 bars of ear candy: risers, reverse cymbals, impacts on the \
+downbeat, sub-drops, filter sweeps, kick drops.
+- Do sections start COLD (suddenly different) or do they have \
+audible lead-in FX (e.g. 1-bar snare roll + reverse cymbal into \
+the chorus, kick drop into the bridge)?
+- Check the transition_events list if provided — are there at \
+least a handful of events spanning the section-boundary count, \
+or is the list empty?
+- Score transition_quality LOW when boundary changes are abrupt \
+or inaudible without a DAW view; HIGH when a blind listener can \
+hear "something is about to change" 1-2 bars before every boundary.
 
 The system already checks quantitative thresholds (note counts, density). \
 Your job is musical taste and artistic quality.

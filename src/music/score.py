@@ -34,6 +34,22 @@ class CCEvent(BaseModel):
     channel: int = 0
 
 
+class TransitionEvent(BaseModel):
+    """Round 2 Phase B4 — an ear-candy event at a section boundary.
+
+    Two event families coexist:
+      * MIDI-ish (snare_roll, kick_drop, crash) → realized by the MIDI
+        writer now.
+      * Sample-ish (riser, reverse_cymbal, impact, sub_drop,
+        downlifter) → realized by the Phase F mix bus from the
+        assets/transitions/ stem library.
+    """
+    beat: float
+    kind: str                    # snare_roll | reverse_cymbal | riser | ...
+    target_section: str = ""     # the section this transition leads INTO
+    params: dict = Field(default_factory=dict)
+
+
 class ScoreSection(BaseModel):
     name: str
     start_beat: float
@@ -74,6 +90,9 @@ class Score(BaseModel):
     time_signature: list[int] = Field(default_factory=lambda: [4, 4])
     sections: list[ScoreSection] = Field(default_factory=list)
     tracks: list[ScoreTrack] = Field(default_factory=list)
+    # Round 2 Phase B4: ear-candy events at section boundaries.
+    # Written by the TransitionAgent after Phase 3 completes.
+    transition_events: list[TransitionEvent] = Field(default_factory=list)
     version: int = 1
 
     def to_summary(self) -> str:
