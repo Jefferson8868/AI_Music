@@ -37,6 +37,7 @@ from src.agents.bass_agent import BassAgent, extract_kick_positions
 from src.agents.transition_agent import TransitionAgent
 from src.llm.client import create_llm_client
 from src.llm.prompts import (
+    SPOTLIGHT_REVIEW_SYSTEM,
     build_composer_section_prompt,
     build_spotlight_review_prompt,
 )
@@ -584,6 +585,13 @@ def _apply_proposal_to_plan(
             f"+{prop.add_instruments} -{prop.remove_instruments}"
         )
     return changed
+
+
+# Re-export from the lightweight helper module so existing call sites and
+# tests can import from either location.
+from src.agents.spotlight_review import (
+    parse_spotlight_review_decisions as _parse_spotlight_review_decisions,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -1569,7 +1577,6 @@ class MusicGenerationPipeline:
                         proposals=collected_proposals,
                         spotlight_plan=spotlight_plan,
                         blueprint_instruments=blueprint_instruments,
-                        messages=messages,
                     )
 
                 total_n = sum(len(n) for n in all_tracks.values())
@@ -2117,7 +2124,6 @@ class MusicGenerationPipeline:
                         proposals=critic_proposals,
                         spotlight_plan=spotlight_plan,
                         blueprint_instruments=blueprint_instruments,
-                        messages=messages,
                     )
 
                 if passes:
@@ -2406,13 +2412,14 @@ class MusicGenerationPipeline:
         proposals: list[tuple[str, SpotlightProposal]],
         spotlight_plan: list[SpotlightEntry],
         blueprint_instruments: list[dict],
-        messages: list[dict],
     ) -> None:
         """Arbitrate spotlight proposals.
 
         - confidence >= SPOTLIGHT_AUTO_ACCEPT: apply immediately.
         - confidence <  SPOTLIGHT_AUTO_DROP: drop immediately.
-        - between: ask Orchestrator to decide (one batched call).
+        - between: ask the LLM directly (one batched call, bypassing
+          OrchestratorAgent so the raw ``{"decisions": [...]}`` JSON
+          isn't rewritten into a blueprint).
         """
         all_inst_names = [
             i.get("name", "")
@@ -2467,12 +2474,12 @@ class MusicGenerationPipeline:
             current_spotlight=current_spotlight_dicts,
         )
         logger.info(
-            f"[spotlight] Orchestrator reviewing "
+            f"[spotlight] reviewing "
             f"{len(mid_conf)} mid-confidence proposal(s)"
         )
         try:
-            review_resp = await self._call_agent(
-                self.orchestrator, messages, review_prompt,
+            review_resp = await self._review_spotlight_via_llm(
+                review_prompt,
             )
         except Exception as e:
             logger.warning(
@@ -2480,22 +2487,9 @@ class MusicGenerationPipeline:
                 "mid-confidence proposals dropped"
             )
             return
-        messages.append({
-            "source": "orchestrator", "content": review_resp,
-        })
-        accepted_indices: set[int] = set()
-        for data in _find_json_objects(review_resp):
-            decisions = data.get("decisions", [])
-            if not isinstance(decisions, list):
-                continue
-            for dec in decisions:
-                if not isinstance(dec, dict):
-                    continue
-                idx = dec.get("index")
-                if not isinstance(idx, int):
-                    continue
-                if 0 <= idx < len(mid_conf) and dec.get("accept"):
-                    accepted_indices.add(idx)
+        accepted_indices = _parse_spotlight_review_decisions(
+            review_resp, len(mid_conf),
+        )
         for idx, (source, prop) in enumerate(mid_conf):
             if idx in accepted_indices:
                 _apply_proposal_to_plan(
@@ -2507,6 +2501,29 @@ class MusicGenerationPipeline:
                     f"[spotlight] reviewer rejected {source} "
                     f"proposal for '{prop.section}'"
                 )
+
+    async def _review_spotlight_via_llm(self, review_prompt: str) -> str:
+        """Call the LLM directly for spotlight-proposal arbitration.
+
+        This bypasses OrchestratorAgent (which always wraps replies as
+        "[Orchestrator] Blueprint created:\\n```json\\n{...}\\n```" and
+        would hide the ``{"decisions": [...]}`` JSON we need). The review
+        is also excluded from the shared messages history because the
+        accept/reject verdict is not useful context for downstream
+        composer / critic calls.
+        """
+        from autogen_core.models import SystemMessage, UserMessage
+
+        llm_messages = [
+            SystemMessage(content=SPOTLIGHT_REVIEW_SYSTEM),
+            UserMessage(content=review_prompt, source="pipeline"),
+        ]
+        result = await self._llm_client.create(
+            llm_messages, cancellation_token=self._cancel,
+        )
+        raw = result.content if isinstance(result.content, str) \
+            else str(result.content)
+        return raw
 
     async def _call_agent(
         self, agent, history: list[dict], user_content: str,
