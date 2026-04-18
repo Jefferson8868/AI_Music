@@ -27,6 +27,34 @@ class Settings(BaseSettings):
     # Unavailable engines degrade to NullEngine silently.
     reference_engines: str = "magenta"
 
+    # Round 2 Phase C: MIDI humanizer (velocity jitter, micro-timing,
+    # tempo breathing, round-robin detune). Set humanize=False for
+    # bit-exact reproducible output; set humanize_seed=None for a
+    # different seed every run.
+    humanize: bool = True
+    humanize_seed: int | None = 0
+
+    # Round 2 Phase D: FluidSynth audio render.
+    # render_audio=True → pipeline emits a .wav alongside .mid.
+    # Silently no-ops when FluidSynth isn't installed.
+    render_audio: bool = True
+    soundfont_path: Path | None = None    # None → bundled combined.sf2
+    render_sample_rate: int = 44100
+
+    # Round 2 Phase E: DiffSinger / OpenUtau vocal synthesis.
+    # synthesize_vocals=True → pipeline emits a {title}_vocal.wav when
+    # lyrics + a melody track are both present. Silently no-ops when the
+    # OpenUtau CLI or a voicebank isn't installed.
+    synthesize_vocals: bool = True
+    vocal_voicebank: str = "default"  # folder name or explicit path
+    # OpenUtau CLI binary name (overridable for CI / non-PATH installs).
+    openutau_cli: str = "OpenUtau"
+
+    # Round 2 Phase F: pedalboard mix bus (per-section reverb, sidechain,
+    # panning, transition stem placement). When False the pipeline leaves
+    # the raw FluidSynth .wav alone.
+    apply_mix: bool = True
+
     # Music defaults
     default_tempo: int = 120
     default_time_signature: tuple[int, int] = (4, 4)

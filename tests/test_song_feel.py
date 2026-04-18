@@ -133,7 +133,8 @@ def test_bass_agent_locks_to_kick_positions():
         assert round(k, 2) in bass_beats
 
 
-def test_bass_agent_silent_without_kicks():
+def test_bass_agent_falls_back_when_kicks_is_none():
+    """kick_positions=None means 'no info' → 4-on-floor fallback."""
     agent = BassAgent()
     track = agent.compose_section(
         section_role="intro",
@@ -142,11 +143,28 @@ def test_bass_agent_silent_without_kicks():
         bars=2,
         key_root_midi=36,
         scale_type="major",
-        kick_positions=[],   # no drums → bass falls back to 4-on-floor
+        kick_positions=None,   # no info → fallback
         chord_progression=["I"],
     )
-    # Fallback to default-kick behavior: bass still has a line.
     assert track.notes, "Bass should fall back to a skeletal line"
+
+
+def test_bass_agent_silent_when_kicks_list_is_empty():
+    """kick_positions=[] means 'explicitly no kicks' → bass stays silent."""
+    agent = BassAgent()
+    track = agent.compose_section(
+        section_role="intro",
+        start_beat=0.0,
+        end_beat=8.0,
+        bars=2,
+        key_root_midi=36,
+        scale_type="major",
+        kick_positions=[],   # explicit empty → no bass
+        chord_progression=["I"],
+    )
+    assert track.notes == [], (
+        "Bass should be silent when there are no kicks"
+    )
 
 
 def test_bass_agent_downbeat_hits_root():

@@ -70,6 +70,9 @@ class ScoreTrack(BaseModel):
     pitch_bends: list[PitchBendEvent] = Field(default_factory=list)
     cc_events: list[CCEvent] = Field(default_factory=list)
     rendered: bool = False
+    # Round 2 Phase C: humanizer applied? Prevents double-jitter on
+    # idempotent re-renders.
+    humanized: bool = False
 
 
 _MIDI_NOTE_NAMES = [

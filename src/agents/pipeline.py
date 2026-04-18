@@ -62,6 +62,22 @@ from src.music.ornaments import (
     ornament_is_known,
 )
 from src.music.performance import apply_performance_render
+from src.music.performance_chinese import apply_chinese_performance
+from src.music.humanize import humanize_score
+from src.audio import (
+    MixError,
+    RendererError,
+    is_mix_available,
+    is_renderer_available,
+    mix_stems,
+    render_midi_to_wav,
+)
+from src.vocals import (
+    VocalSynthError,
+    is_vocal_synth_available,
+    lyrics_to_phonemes,
+    render_vocal_stem,
+)
 from src.music.score import (
     Score, ScoreNote, ScoreSection, ScoreTrack,
     SpotlightEntry, SpotlightProposal,
@@ -2174,6 +2190,37 @@ class MusicGenerationPipeline:
                     "Falling back to un-rendered score."
                 )
 
+            # ---- Phase 4b: Chinese-instrument idiom pass ----
+            # erhu / dizi / pipa get delayed vibrato + portamento +
+            # breath spikes. Runs after generic ornament expansion so
+            # its events layer on top without clobbering the ornament
+            # bends.
+            try:
+                logger.info("=== Phase 4b: Chinese-instrument idioms ===")
+                final_score = apply_chinese_performance(final_score)
+            except Exception as e:
+                logger.warning(
+                    f"[Phase4b] Chinese-idiom pass failed: {e}"
+                )
+
+            # ---- Phase 4c: Humanizer ----
+            # Velocity jitter + micro-timing + round-robin detune +
+            # phrase-level tempo breathing. Idempotent via
+            # ScoreTrack.humanized. Runs LAST so its jitter sits on top
+            # of everything deterministic.
+            try:
+                logger.info("=== Phase 4c: Humanizer ===")
+                if settings.humanize:
+                    final_score = humanize_score(
+                        final_score, seed=settings.humanize_seed,
+                    )
+                else:
+                    logger.info(
+                        "[Phase4c] Humanizer disabled via settings"
+                    )
+            except Exception as e:
+                logger.warning(f"[Phase4c] Humanizer failed: {e}")
+
             ts = int(time.time())
             midi_path = str(
                 settings.output_dir / f"{safe_t}_{ts}.mid"
@@ -2183,6 +2230,146 @@ class MusicGenerationPipeline:
                 articulations=articulations,
             )
             logger.info(f"Final MIDI exported: {midi_path}")
+
+            # ---- Phase 5: Audio render (MIDI → WAV via FluidSynth) ----
+            wav_path: str | None = None
+            if settings.render_audio and is_renderer_available():
+                try:
+                    logger.info("=== Phase 5: Audio render ===")
+                    wav = render_midi_to_wav(
+                        midi_path,
+                        out_path=Path(midi_path).with_suffix(".wav"),
+                        soundfont=settings.soundfont_path,
+                        sample_rate=settings.render_sample_rate,
+                    )
+                    wav_path = str(wav)
+                    logger.info(f"[Phase5] Rendered audio: {wav_path}")
+                except (RendererError, FileNotFoundError, Exception) as e:
+                    logger.warning(
+                        f"[Phase5] Audio render failed: {e}. "
+                        "MIDI file was still saved."
+                    )
+            elif settings.render_audio:
+                logger.info(
+                    "[Phase5] render_audio=True but no FluidSynth "
+                    "backend is installed; skipping audio render. "
+                    "Install `pyfluidsynth` or the fluidsynth CLI "
+                    "to enable."
+                )
+
+            # ---- Phase 5b: Vocal synthesis (DiffSinger / OpenUtau) ----
+            # Turn lyrics + the melody track into a sung vocal .wav stem.
+            # Silently degrades when OpenUtau isn't installed.
+            vocal_wav_path: str | None = None
+            if (
+                settings.synthesize_vocals
+                and lyrics
+                and is_vocal_synth_available(settings.openutau_cli)
+            ):
+                try:
+                    logger.info("=== Phase 5b: Vocal synthesis ===")
+                    melody_trk = next(
+                        (t for t in final_score.tracks
+                         if "melody" in (t.name or "").lower()
+                         or (t.role or "").lower() == "melody"),
+                        None,
+                    )
+                    if melody_trk is None and final_score.tracks:
+                        melody_trk = final_score.tracks[0]
+
+                    phonemes = lyrics_to_phonemes(
+                        lyrics=lyrics,
+                        melody_track=melody_trk,
+                    )
+                    if phonemes:
+                        vocal_out = Path(midi_path).with_name(
+                            Path(midi_path).stem + "_vocal.wav"
+                        )
+                        vocal_wav = render_vocal_stem(
+                            phonemes,
+                            voicebank=settings.vocal_voicebank,
+                            out_path=vocal_out,
+                            tempo_bpm=float(tempo),
+                            project_name=title,
+                        )
+                        vocal_wav_path = str(vocal_wav)
+                        logger.info(
+                            f"[Phase5b] Rendered vocal stem: "
+                            f"{vocal_wav_path} "
+                            f"({len(phonemes)} syllables)"
+                        )
+                    else:
+                        logger.info(
+                            "[Phase5b] No phonemes produced (empty "
+                            "lyrics or no melody notes). Skipping."
+                        )
+                except VocalSynthError as e:
+                    logger.warning(
+                        f"[Phase5b] Vocal synthesis failed: {e}. "
+                        "Instrumental output still saved."
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"[Phase5b] Vocal synthesis errored "
+                        f"unexpectedly: {e}"
+                    )
+            elif settings.synthesize_vocals and lyrics:
+                logger.info(
+                    "[Phase5b] synthesize_vocals=True but OpenUtau CLI "
+                    "not on PATH; skipping vocal synthesis. Install "
+                    "OpenUtau from https://www.openutau.com/ to enable."
+                )
+            elif settings.synthesize_vocals:
+                logger.info(
+                    "[Phase5b] synthesize_vocals=True but no lyrics "
+                    "in this Score; skipping."
+                )
+
+            # ---- Phase 6: Mix bus (sum + transition stems + FX) ----
+            # Requires a base instrumental .wav (Phase 5) to exist.
+            # Pedalboard FX chain is applied if the optional dep is
+            # installed; otherwise we just sum + place stems.
+            mixed_wav_path: str | None = None
+            if settings.apply_mix and wav_path and is_mix_available():
+                try:
+                    logger.info("=== Phase 6: Mix bus ===")
+                    mix_out = Path(wav_path).with_name(
+                        Path(wav_path).stem + "_mixed.wav"
+                    )
+                    mixed = mix_stems(
+                        instrumental_wav=wav_path,
+                        vocal_wav=vocal_wav_path,
+                        transition_events=getattr(
+                            final_score, "transition_events", None,
+                        ),
+                        section_plan=spotlight_plan,
+                        tempo_bpm=float(tempo),
+                        out_path=mix_out,
+                        seed=settings.humanize_seed or 0,
+                    )
+                    mixed_wav_path = str(mixed)
+                    logger.info(
+                        f"[Phase6] Final mix written: {mixed_wav_path}"
+                    )
+                except MixError as e:
+                    logger.warning(
+                        f"[Phase6] Mix failed ({e}); instrumental + "
+                        "optional vocal still available."
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"[Phase6] Mix errored unexpectedly: {e}"
+                    )
+            elif settings.apply_mix and not wav_path:
+                logger.info(
+                    "[Phase6] apply_mix=True but no instrumental WAV "
+                    "was produced in Phase 5; skipping mix."
+                )
+            elif settings.apply_mix:
+                logger.info(
+                    "[Phase6] apply_mix=True but numpy/soundfile "
+                    "missing; skipping mix. Install both to enable."
+                )
 
             if self._on_progress:
                 await self._on_progress(
@@ -2194,6 +2381,9 @@ class MusicGenerationPipeline:
                 total_messages=len(messages),
                 completed=True,
                 midi_path=midi_path,
+                wav_path=wav_path,
+                vocal_wav_path=vocal_wav_path,
+                mixed_wav_path=mixed_wav_path,
                 score=final_score,
                 snapshots=snapshots,
             )
@@ -2606,6 +2796,9 @@ class PipelineResult:
         completed: bool = False,
         error: str | None = None,
         midi_path: str | None = None,
+        wav_path: str | None = None,
+        vocal_wav_path: str | None = None,
+        mixed_wav_path: str | None = None,
         score: Score | None = None,
         snapshots: list[str] | None = None,
     ):
@@ -2614,6 +2807,12 @@ class PipelineResult:
         self.completed = completed
         self.error = error
         self.midi_path = midi_path
+        # Round 2 Phase D: WAV rendered from the final MIDI (FluidSynth).
+        self.wav_path = wav_path
+        # Round 2 Phase E: separately-synthesized vocal stem.
+        self.vocal_wav_path = vocal_wav_path
+        # Round 2 Phase F: mixdown (instrumental + vocal + transitions).
+        self.mixed_wav_path = mixed_wav_path
         self.score = score
         self.snapshots = snapshots or []
 
@@ -2623,6 +2822,9 @@ class PipelineResult:
             "completed": self.completed,
             "error": self.error,
             "midi_path": self.midi_path,
+            "wav_path": self.wav_path,
+            "vocal_wav_path": self.vocal_wav_path,
+            "mixed_wav_path": self.mixed_wav_path,
             "snapshots": self.snapshots,
             "agents_involved": list(
                 {m["source"] for m in self.messages}
