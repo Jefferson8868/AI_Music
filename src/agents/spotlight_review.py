@@ -52,6 +52,60 @@ def _find_json_objects(text: str) -> list[dict]:
     return results
 
 
+# ---------------------------------------------------------------------------
+# Drum / bass instrument-name detection (Bug B)
+#
+# Spotlight presets use short tokens ("drums", "bass") that are resolved
+# by spotlight_presets._match_instrument to the blueprint's canonical
+# names ("Cinematic Drums", "Synth Bass"). Phase 3.5 gating must match
+# those canonical names, not just the short tokens — otherwise DrumAgent
+# and BassAgent are silently skipped.
+# ---------------------------------------------------------------------------
+
+DRUM_TOKENS: frozenset[str] = frozenset({
+    "drums", "drum", "drum kit", "percussion", "perc",
+})
+
+BASS_TOKENS: frozenset[str] = frozenset({
+    "bass", "electric bass", "bass guitar", "synth bass",
+    "e-bass", "e bass", "upright bass", "acoustic bass",
+})
+
+
+def _contains_token(name: str, tokens: frozenset[str]) -> bool:
+    """Return True if ``name`` contains any token as a whole word.
+
+    Whole-word match (regex ``\\b...\\b``) is used so "Bassoon" doesn't
+    accidentally register as bass, while "Electric Bass" and "E-Bass"
+    still do. Multi-word tokens ("drum kit") are matched with whitespace
+    collapsed and internal spaces treated as flexible whitespace.
+    """
+    if not name:
+        return False
+    haystack = name.lower().strip()
+    for token in tokens:
+        # Build a whole-word regex; internal spaces become \s+ so that
+        # "drum kit" can match "Drum  Kit" etc.
+        pattern = r"\b" + r"\s+".join(re.escape(p) for p in token.split()) \
+            + r"\b"
+        if re.search(pattern, haystack):
+            return True
+    return False
+
+
+def match_drum_token(name: str) -> bool:
+    """Whole-word substring check against DRUM_TOKENS."""
+    return _contains_token(name, DRUM_TOKENS)
+
+
+def match_bass_token(name: str) -> bool:
+    """Whole-word substring check against BASS_TOKENS.
+
+    Excludes false positives like "Bassoon" via the whole-word boundary.
+    """
+    return _contains_token(name, BASS_TOKENS)
+
+
 def parse_spotlight_review_decisions(
     review_resp: str, n_proposals: int,
 ) -> set[int]:

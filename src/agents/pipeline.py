@@ -590,6 +590,8 @@ def _apply_proposal_to_plan(
 # Re-export from the lightweight helper module so existing call sites and
 # tests can import from either location.
 from src.agents.spotlight_review import (
+    match_bass_token as _match_bass_token,
+    match_drum_token as _match_drum_token,
     parse_spotlight_review_decisions as _parse_spotlight_review_decisions,
 )
 
@@ -2609,30 +2611,23 @@ class MusicGenerationPipeline:
             e.section.lower(): e for e in spotlight_plan
         }
 
-        # Token sets for matching instrument names.
-        _DRUM_TOKENS = {
-            "drums", "drum", "drum kit", "percussion", "perc",
-        }
-        _BASS_TOKENS = {
-            "bass", "electric bass", "bass guitar", "synth bass",
-            "e-bass", "upright bass", "acoustic bass",
-        }
         _KNOWN_ROLES = {
             "intro", "verse", "pre_chorus",
             "chorus", "bridge", "outro",
         }
 
         # -- Decide up front whether we'll emit any drum / bass track. --
+        #    Use whole-word substring matching so canonical instrument
+        #    names like "Cinematic Drums" or "Synth Bass" count.
         any_drum = False
         any_bass = False
         for sec in enriched_sections:
             entry = spotlight_by_section.get(sec["name"].lower())
             if entry is None:
                 continue
-            active_lower = {a.lower() for a in entry.active}
-            if active_lower & _DRUM_TOKENS:
+            if any(_match_drum_token(a) for a in entry.active):
                 any_drum = True
-            if active_lower & _BASS_TOKENS:
+            if any(_match_bass_token(a) for a in entry.active):
                 any_bass = True
             if any_drum and any_bass:
                 break
@@ -2643,15 +2638,17 @@ class MusicGenerationPipeline:
             kept: list[ScoreTrack] = []
             removed = 0
             for t in final_score.tracks:
-                name_l = (t.name or "").lower()
-                inst_l = (t.instrument or "").lower()
+                name = t.name or ""
+                inst = t.instrument or ""
                 role_l = (t.role or "").lower()
-                is_drum_tok = any(tok in name_l for tok in _DRUM_TOKENS) \
-                    or any(tok in inst_l for tok in _DRUM_TOKENS) \
+                is_drum_tok = (
+                    _match_drum_token(name)
+                    or _match_drum_token(inst)
                     or role_l == "rhythm"
+                )
                 is_bass_tok = (
-                    name_l in _BASS_TOKENS
-                    or inst_l in _BASS_TOKENS
+                    _match_bass_token(name)
+                    or _match_bass_token(inst)
                     or role_l == "bass"
                 )
                 if (any_drum and is_drum_tok) or (any_bass and is_bass_tok):
@@ -2681,9 +2678,8 @@ class MusicGenerationPipeline:
             entry = spotlight_by_section.get(sec_name.lower())
             if entry is None:
                 continue
-            active_lower = {a.lower() for a in entry.active}
-            wants_drums = bool(active_lower & _DRUM_TOKENS)
-            wants_bass = bool(active_lower & _BASS_TOKENS)
+            wants_drums = any(_match_drum_token(a) for a in entry.active)
+            wants_bass = any(_match_bass_token(a) for a in entry.active)
             if not (wants_drums or wants_bass):
                 continue
 
