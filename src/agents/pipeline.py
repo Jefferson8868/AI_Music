@@ -86,8 +86,12 @@ from src.music.score import (
 )
 from src.music.lyrics_alignment import (
     analyze_lyrics,
+    compute_section_char_targets,
+    format_char_count_plan_for_lyricist,
+    format_char_count_violations,
     format_density_plan_for_lyricist,
     format_lyrics_feedback_for_lyricist,
+    validate_section_char_counts,
 )
 from src.music.midi_writer import save_score_midi
 from config.settings import settings
@@ -1650,6 +1654,19 @@ class MusicGenerationPipeline:
                 if density_plan_text:
                     lyricist_context += density_plan_text + "\n\n"
 
+                # Bug D: absolute per-section character budget. Density
+                # alone was advisory and frequently ignored; this adds a
+                # HARD min/target/max character count per section so the
+                # validator below can re-prompt on concrete violations.
+                char_targets = compute_section_char_targets(
+                    enriched_sections,
+                )
+                char_plan_text = format_char_count_plan_for_lyricist(
+                    char_targets,
+                )
+                if char_plan_text:
+                    lyricist_context += char_plan_text + "\n\n"
+
                 lyrics_report = None
                 if lyrics and current_score:
                     try:
@@ -1792,6 +1809,80 @@ class MusicGenerationPipeline:
                                 )
                             if extra_lyrics:
                                 lyrics = extra_lyrics
+
+                # Bug D: per-section character-count validation. After
+                # the total-line re-prompt above we still need to verify
+                # each section lands inside its min/max char budget —
+                # the advisory density target used to let sections slip
+                # (e.g., chorus with 3 characters or verse with 40).
+                if request.include_lyrics and char_targets:
+                    violations = validate_section_char_counts(
+                        lyrics, char_targets,
+                    )
+                    if violations:
+                        logger.info(
+                            f"[Round {rnd}] Char-count violations in "
+                            f"{len(violations)} section(s), re-prompting"
+                        )
+                        reprompt_ctx = (
+                            lyricist_context
+                            + "\n\n"
+                            + format_char_count_violations(violations)
+                            + "\n\nEmit the FULL lyrics JSON again "
+                            "with ONLY the violations above corrected. "
+                            "Keep sections that were already in range "
+                            "unchanged. Respect the HARD character "
+                            "budget for every section."
+                        )
+                        lyr_resp3 = await self._call_agent(
+                            self.lyricist, messages, reprompt_ctx,
+                        )
+                        messages.append({
+                            "source": "lyricist",
+                            "content": lyr_resp3,
+                        })
+                        fixed_lyrics: list[dict] = []
+                        for data in _find_json_objects(lyr_resp3):
+                            if (
+                                "lyrics" in data
+                                and isinstance(data["lyrics"], list)
+                            ):
+                                fixed_lyrics.extend(data["lyrics"])
+                            elif (
+                                "lines" in data
+                                and isinstance(data["lines"], list)
+                            ):
+                                fixed_lyrics.append(data)
+                        if fixed_lyrics and current_score:
+                            melody_trk = next(
+                                (t for t in current_score.tracks
+                                 if "melody" in t.name.lower()
+                                 or t.role == "melody"),
+                                None,
+                            )
+                            if melody_trk:
+                                mb = {
+                                    n.start_beat
+                                    for n in melody_trk.notes
+                                }
+                                fixed_lyrics = _filter_lyrics_to_melody(
+                                    fixed_lyrics, mb,
+                                )
+                            if fixed_lyrics:
+                                # Only adopt the corrected version if
+                                # it actually reduces violations — a
+                                # regression would be worse than the
+                                # original underfill.
+                                new_violations = (
+                                    validate_section_char_counts(
+                                        fixed_lyrics, char_targets,
+                                    )
+                                )
+                                if (
+                                    len(new_violations)
+                                    <= len(violations)
+                                ):
+                                    lyrics = fixed_lyrics
 
                 # -- 2c. Instrumentalist --
                 if self._on_progress:

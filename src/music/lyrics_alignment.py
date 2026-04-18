@@ -562,12 +562,203 @@ def format_density_plan_for_lyricist(
     return "\n".join(out)
 
 
+# --------------------------------------------------------------------------- #
+# Per-section character budget (Bug D)                                        #
+# --------------------------------------------------------------------------- #
+
+def count_lyric_chars(text: str) -> int:
+    """Count lyric units in a line.
+
+    Chinese: number of Chinese glyphs. Latin: whitespace-split tokens.
+    Mixed: Chinese count wins (CJK glyphs are the syllables that line
+    up with melody notes).
+    """
+    if not text:
+        return 0
+    text = text.strip()
+    has_cjk = any(_is_chinese_char(c) for c in text)
+    if has_cjk:
+        return sum(1 for c in text if _is_chinese_char(c))
+    return len([t for t in text.split() if t])
+
+
+def compute_section_char_targets(
+    enriched_sections: list[dict],
+    lyric_section_names: list[str] | None = None,
+) -> list[dict]:
+    """Convert per-beat density into absolute character budgets.
+
+    Args:
+        enriched_sections: sections with ``start_beat`` / ``end_beat`` /
+            ``role`` / ``name``.
+        lyric_section_names: optional allow-list of section names that
+            should carry lyrics (e.g. featured sections). Sections not
+            in this list are skipped entirely. ``None`` means "include
+            every section with a non-zero target density".
+
+    Returns:
+        A list of dicts with ``section_name``, ``role``, ``span_beats``,
+        ``min_chars``, ``target_chars``, ``max_chars``. Only sections
+        that need lyrics (target_chars > 0) are included.
+    """
+    allow = (
+        {s.lower() for s in lyric_section_names}
+        if lyric_section_names is not None
+        else None
+    )
+    targets: list[dict] = []
+    for sec in enriched_sections:
+        name = sec.get("name", "")
+        role = (
+            sec.get("role") or sec.get("mood") or name
+        )
+        span = max(
+            float(sec.get("end_beat", 0.0))
+            - float(sec.get("start_beat", 0.0)),
+            0.0,
+        )
+        tgt = _density_target(role)
+        target_chars = int(round(tgt["target"] * span))
+        if allow is not None:
+            if name.lower() not in allow:
+                continue
+        elif target_chars <= 0:
+            continue
+        targets.append({
+            "section_name": name,
+            "role": role,
+            "span_beats": span,
+            "min_chars": max(int(round(tgt["min"] * span)), 0),
+            "target_chars": target_chars,
+            "max_chars": max(int(round(tgt["max"] * span)), target_chars),
+        })
+    return targets
+
+
+def format_char_count_plan_for_lyricist(targets: list[dict]) -> str:
+    """Strict, per-section character budget for the Lyricist prompt.
+
+    Unlike ``format_density_plan_for_lyricist`` this states ABSOLUTE
+    counts (not a per-beat rate) so the Lyricist has a concrete number
+    to hit rather than a rate to multiply.
+    """
+    if not targets:
+        return ""
+    out = [
+        "LYRICS CHARACTER BUDGET (HARD requirement — each section "
+        "must land in its range):",
+    ]
+    for t in targets:
+        out.append(
+            f"  [{t['section_name']}] "
+            f"need {t['min_chars']}-{t['max_chars']} characters "
+            f"(target {t['target_chars']}), "
+            f"across {t['span_beats']:.0f} beats."
+        )
+    out.append(
+        "Count Chinese glyphs one-by-one; for Latin text count "
+        "whitespace-separated words. Punctuation does not count. "
+        "If you cannot fill a section, use melisma (one character on "
+        "multiple notes) but still hit the minimum."
+    )
+    return "\n".join(out)
+
+
+def validate_section_char_counts(
+    lyrics: list[dict],
+    targets: list[dict],
+) -> list[dict]:
+    """Check each section's current character count against its target.
+
+    Args:
+        lyrics: list of ``{section_name, lines: [{text, ...}]}`` blocks
+            (the shape emitted by Lyricist).
+        targets: output of ``compute_section_char_targets``.
+
+    Returns:
+        One dict per out-of-range section, with keys ``section_name``,
+        ``current_chars``, ``min_chars``, ``max_chars``, ``verdict``
+        ("too_sparse" or "too_dense"), and ``instruction`` (prompt-ready
+        corrective text). Empty list means the lyrics are on-target.
+    """
+    counts: dict[str, int] = {}
+    for block in lyrics:
+        if not isinstance(block, dict):
+            continue
+        name = str(block.get("section_name", "")).strip()
+        if not name:
+            continue
+        total = 0
+        for line in block.get("lines", []) or []:
+            if isinstance(line, dict):
+                total += count_lyric_chars(str(line.get("text", "")))
+            elif isinstance(line, str):
+                total += count_lyric_chars(line)
+        counts[name.lower()] = counts.get(name.lower(), 0) + total
+
+    violations: list[dict] = []
+    for t in targets:
+        name = t["section_name"]
+        current = counts.get(name.lower(), 0)
+        if current < t["min_chars"]:
+            deficit = t["min_chars"] - current
+            violations.append({
+                "section_name": name,
+                "current_chars": current,
+                "min_chars": t["min_chars"],
+                "max_chars": t["max_chars"],
+                "target_chars": t["target_chars"],
+                "verdict": "too_sparse",
+                "instruction": (
+                    f"[{name}] too sparse: have {current} chars, "
+                    f"need at least {t['min_chars']} "
+                    f"(target {t['target_chars']}). "
+                    f"ADD {deficit}+ characters."
+                ),
+            })
+        elif current > t["max_chars"]:
+            excess = current - t["max_chars"]
+            violations.append({
+                "section_name": name,
+                "current_chars": current,
+                "min_chars": t["min_chars"],
+                "max_chars": t["max_chars"],
+                "target_chars": t["target_chars"],
+                "verdict": "too_dense",
+                "instruction": (
+                    f"[{name}] too dense: have {current} chars, "
+                    f"max is {t['max_chars']} "
+                    f"(target {t['target_chars']}). "
+                    f"TRIM {excess}+ characters."
+                ),
+            })
+    return violations
+
+
+def format_char_count_violations(violations: list[dict]) -> str:
+    """Render validate_section_char_counts output as a prompt block."""
+    if not violations:
+        return ""
+    lines = [
+        "CHARACTER-COUNT VIOLATIONS (fix these specifically — the "
+        "previous output was out of range):",
+    ]
+    for v in violations:
+        lines.append(f"  - {v['instruction']}")
+    return "\n".join(lines)
+
+
 __all__ = [
     "DENSITY_TARGETS",
     "LyricLineAnalysis",
     "SectionLyricStats",
     "LyricsAnalysisReport",
     "analyze_lyrics",
+    "count_lyric_chars",
+    "compute_section_char_targets",
     "format_lyrics_feedback_for_lyricist",
     "format_density_plan_for_lyricist",
+    "format_char_count_plan_for_lyricist",
+    "format_char_count_violations",
+    "validate_section_char_counts",
 ]
