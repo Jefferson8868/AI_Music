@@ -34,6 +34,10 @@ from src.agents.synthesizer import SynthesizerAgent
 # Round 2 Phase B: rule-based rhythm / bass / transition agents.
 from src.agents.drum_agent import DrumAgent
 from src.agents.bass_agent import BassAgent, extract_kick_positions
+from src.agents.post_production_delta import (
+    build_cumulative_score_history,
+    build_post_production_delta,
+)
 from src.agents.transition_agent import TransitionAgent
 from src.llm.client import create_llm_client
 from src.llm.prompts import (
@@ -2246,6 +2250,16 @@ class MusicGenerationPipeline:
             if not final_score:
                 final_score = current_score
 
+            # Bug C: snapshot the composer's final score BEFORE any
+            # post-production runs (Phase 3.5 / 4 / 4b / 4c). The final
+            # critic pass (after Phase 4c) uses this snapshot to build a
+            # POST-PRODUCTION DELTA block so it can judge what drums /
+            # bass / ornaments / humanization actually added on top of
+            # the LLM's composed notes.
+            pre_postproduction_score = (
+                final_score.model_copy(deep=True) if final_score else None
+            )
+
             # ---- Phase 3.5: DrumAgent + BassAgent + TransitionAgent ----
             # Augment the final score with song-feel machinery:
             #   * DrumAgent writes a groove-templated drum kit per section
@@ -2319,6 +2333,29 @@ class MusicGenerationPipeline:
                     )
             except Exception as e:
                 logger.warning(f"[Phase4c] Humanizer failed: {e}")
+
+            # ---- Phase 4d: Final critic pass (Bug C) ----
+            # The in-loop critic only ever saw the composer's raw output
+            # — it never got to judge the drums, bass, ornaments, or
+            # humanization that Phase 3.5 / 4 layered on top. Run the
+            # critic ONCE more now with a POST-PRODUCTION DELTA block so
+            # its verdict reflects what the listener actually hears.
+            # Read-only: no re-runs, but the verdict is surfaced on
+            # ``PipelineResult.final_critic`` for callers to inspect.
+            final_critic_round: CriticRound | None = None
+            try:
+                final_critic_round = await self._run_final_critic_pass(
+                    final_score=final_score,
+                    pre_postproduction_score=pre_postproduction_score,
+                    score_history=score_history,
+                    enriched_sections=enriched_sections,
+                    messages=messages,
+                    last_round=critic_round_current,
+                )
+            except Exception as e:
+                logger.warning(
+                    f"[Phase4d] Final critic pass failed: {e}"
+                )
 
             ts = int(time.time())
             midi_path = str(
@@ -2485,6 +2522,7 @@ class MusicGenerationPipeline:
                 mixed_wav_path=mixed_wav_path,
                 score=final_score,
                 snapshots=snapshots,
+                final_critic=final_critic_round,
             )
 
         except Exception as e:
@@ -2617,6 +2655,110 @@ class MusicGenerationPipeline:
         raw = result.content if isinstance(result.content, str) \
             else str(result.content)
         return raw
+
+    async def _run_final_critic_pass(
+        self,
+        final_score: Score,
+        pre_postproduction_score: Score | None,
+        score_history: list[float],
+        enriched_sections: list[dict],
+        messages: list[dict],
+        last_round: "CriticRound | None",
+    ) -> "CriticRound | None":
+        """Bug C: evaluate the fully-rendered score after Phase 4c.
+
+        The in-loop critic only ever sees the composer's raw note grid;
+        this pass hands the critic a score that already has drums, bass,
+        transitions, ornaments, and humanization applied — i.e. what the
+        listener actually hears. We also show the cumulative score
+        trajectory + a POST-PRODUCTION DELTA block so the critic's final
+        verdict is framed against the in-loop history.
+
+        Returns the parsed ``CriticRound`` (or ``None`` if the critic
+        produced no parseable JSON). This pass is read-only — the
+        verdict is surfaced on ``PipelineResult.final_critic`` but never
+        triggers another refinement round.
+        """
+        if final_score is None:
+            return None
+
+        ctx = "FINAL CRITIC PASS — after Phase 3.5 + Phase 4 a/b/c.\n\n"
+
+        ctx += (
+            "Score summary (post-production, what the listener hears):\n"
+            f"{final_score.to_llm_description()}\n\n"
+        )
+
+        try:
+            metrics = compute_score_metrics(
+                final_score, enriched_sections,
+            )
+            ctx += format_metrics_for_critic(metrics) + "\n\n"
+        except Exception as exc:
+            logger.debug(
+                "Final-critic metrics computation failed: %s", exc,
+            )
+
+        delta_block = build_post_production_delta(
+            pre_postproduction_score, final_score,
+        )
+        if delta_block:
+            ctx += delta_block + "\n\n"
+
+        history_block = build_cumulative_score_history(score_history)
+        if history_block:
+            ctx += history_block + "\n\n"
+
+        if last_round is not None:
+            ctx += (
+                "Last in-loop critic verdict:\n"
+                f"  overall_score={last_round.overall_score:.2f}, "
+                f"passes={last_round.passes}\n\n"
+            )
+
+        ctx += (
+            "This is the FINAL critic pass — there are no further "
+            "refinement rounds. Focus on:\n"
+            "  * Did Phase 3.5 / Phase 4 add audible song-feel "
+            "(groove, ornaments, humanization) or does the output "
+            "still sound symphonic/MIDI-scale?\n"
+            "  * Are there regressions introduced by post-production "
+            "(e.g., humanizer broke a deliberate sync point, drums "
+            "drown the melody)?\n"
+            "Emit your standard JSON verdict."
+        )
+
+        crit_resp = await self._call_agent(self.critic, messages, ctx)
+        messages.append({"source": "critic_final", "content": crit_resp})
+
+        final_round: CriticRound | None = None
+        for data in _find_json_objects(crit_resp):
+            parsed = _parse_critic_round(data)
+            if final_round is None:
+                final_round = parsed
+            else:
+                if parsed.overall_score:
+                    final_round.overall_score = parsed.overall_score
+                if parsed.aspect_scores:
+                    final_round.aspect_scores.update(parsed.aspect_scores)
+                final_round.passes = (
+                    final_round.passes or parsed.passes
+                )
+                if parsed.raw_instructions:
+                    final_round.raw_instructions = parsed.raw_instructions
+                final_round.issues.extend(parsed.issues)
+
+        if final_round is not None:
+            logger.info(
+                f"[Phase4d] Final critic "
+                f"score={final_round.overall_score:.2f}, "
+                f"passes={final_round.passes}"
+            )
+        else:
+            logger.warning(
+                "[Phase4d] Final critic returned no parseable JSON"
+            )
+        return final_round
 
     async def _call_agent(
         self, agent, history: list[dict], user_content: str,
@@ -2905,6 +3047,7 @@ class PipelineResult:
         mixed_wav_path: str | None = None,
         score: Score | None = None,
         snapshots: list[str] | None = None,
+        final_critic: "CriticRound | None" = None,
     ):
         self.messages = messages
         self.total_messages = total_messages
@@ -2919,8 +3062,20 @@ class PipelineResult:
         self.mixed_wav_path = mixed_wav_path
         self.score = score
         self.snapshots = snapshots or []
+        # Bug C: verdict from the critic pass that ran AFTER Phase 4c
+        # (ornaments + humanize + drums + transitions applied). None if
+        # the final pass was skipped or failed.
+        self.final_critic = final_critic
 
     def summary(self) -> dict:
+        final_critic_summary: dict | None = None
+        if self.final_critic is not None:
+            final_critic_summary = {
+                "overall_score": self.final_critic.overall_score,
+                "passes": self.final_critic.passes,
+                "aspect_scores": self.final_critic.aspect_scores,
+                "plateau_warning": self.final_critic.plateau_warning,
+            }
         return {
             "total_messages": self.total_messages,
             "completed": self.completed,
@@ -2933,4 +3088,5 @@ class PipelineResult:
             "agents_involved": list(
                 {m["source"] for m in self.messages}
             ),
+            "final_critic": final_critic_summary,
         }
