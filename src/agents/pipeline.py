@@ -38,6 +38,11 @@ from src.agents.post_production_delta import (
     build_cumulative_score_history,
     build_post_production_delta,
 )
+from src.agents.section_continuity import (
+    extract_section_tail,
+    format_main_hook_for_composer,
+    format_section_tail_for_composer,
+)
 from src.agents.transition_agent import TransitionAgent
 from src.llm.client import create_llm_client
 from src.llm.prompts import (

@@ -198,6 +198,8 @@ def build_composer_section_prompt(
     continuity_profiles: dict[str, dict] | None = None,
     theory_hints: list[str] | None = None,
     draft_perspectives: dict[str, list[dict]] | None = None,
+    previous_section_tail: str = "",
+    main_hook: str = "",
 ) -> str:
     """Build a focused prompt for composing ONE section.
 
@@ -441,6 +443,21 @@ def build_composer_section_prompt(
             "Previous sections (continue smoothly from here):"
         )
         parts.append(previous_summary)
+
+    # Bug E: give the composer the actual last-8-beats material from the
+    # previous section so it writes a real continuation, not "here's a
+    # fresh idea in the same key".
+    if previous_section_tail:
+        parts.append("")
+        parts.append(previous_section_tail)
+
+    # Bug E: inject the shared main hook when the section is one where
+    # the composer is expected to quote or reference it (verse /
+    # pre_chorus / chorus). format_main_hook_for_composer already
+    # filters out intro/bridge/outro.
+    if main_hook:
+        parts.append("")
+        parts.append(main_hook)
 
     if draft_description:
         parts.append("")

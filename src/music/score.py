@@ -277,6 +277,12 @@ class CompositionBlueprint(BaseModel):
     primer_temperature: float = 1.0
     global_notes: str = ""
     spotlight_plan: list[SpotlightEntry] = Field(default_factory=list)
+    # Bug E: a short melodic motif (3-8 notes) that the composer is
+    # asked to quote or reference in verse + chorus sections. Gives the
+    # piece motivic unity so sections don't sound disjointed. Notes are
+    # scale-degree based (pitch = absolute MIDI) with start_beat RELATIVE
+    # to the motif's own start (i.e. beat 0 is the motif's downbeat).
+    main_hook: list[ScoreNote] = Field(default_factory=list)
 
 
 class CriticIssue(BaseModel):
