@@ -83,7 +83,20 @@ featured, not modern ones.
 - Outro: fade with a fragile featured instrument (usually Dizi).
 
 If you omit spotlight_plan, the system falls back to a generic preset, \
-but you should ALWAYS include one tailored to the requested style."""
+but you should ALWAYS include one tailored to the requested style.
+
+MAIN HOOK (optional, strongly encouraged):
+A pop song has ONE memorable motif that recurs across verse + chorus. \
+If you want to fix the hook in advance, add a top-level "main_hook" \
+array of 3-8 note objects (pitch MIDI int, start_beat float from 0.0, \
+duration_beats float, optional velocity 0-127). The Composer will quote \
+or reference this motif in every verse + chorus. Example:
+  "main_hook": [
+    {"pitch": 67, "start_beat": 0.0, "duration_beats": 1.0},
+    {"pitch": 69, "start_beat": 1.0, "duration_beats": 0.5},
+    {"pitch": 72, "start_beat": 1.5, "duration_beats": 1.5}
+  ]
+If omitted, the system derives a fallback hook from the Magenta draft."""
 
 
 # --- Composer: per-section template ---

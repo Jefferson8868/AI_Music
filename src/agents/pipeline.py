@@ -1258,6 +1258,7 @@ class MusicGenerationPipeline:
             )
 
             orch_data_full: dict = {}
+            orchestrator_main_hook: list[dict] = []
             for data in _find_json_objects(orch_resp):
                 title = data.get("title", title)
                 key = data.get("key", key)
@@ -1274,6 +1275,13 @@ class MusicGenerationPipeline:
                         blueprint_instruments.append(inst)
                 if "spotlight_plan" in data:
                     orch_data_full = data
+                # Bug E: main_hook motif — quoted in verse + chorus so
+                # the piece has motivic unity across sections.
+                hook_candidate = data.get("main_hook")
+                if isinstance(hook_candidate, list) and hook_candidate:
+                    orchestrator_main_hook = [
+                        n for n in hook_candidate if isinstance(n, dict)
+                    ]
 
             enriched_sections = _enrich_sections(
                 blueprint_sections, bpb,
@@ -1342,6 +1350,35 @@ class MusicGenerationPipeline:
                     "[Phase1] No usable score from Magenta"
                 )
 
+            # Bug E: if the Orchestrator didn't emit an explicit main_hook,
+            # fall back to the first 6 notes of the Magenta melody draft so
+            # verse + chorus still have a shared motif to quote.
+            main_hook_notes: list[dict] = list(orchestrator_main_hook)
+            if not main_hook_notes and draft_score:
+                melody_trk = next(
+                    (
+                        t for t in draft_score.tracks
+                        if (t.role or "").lower() == "melody"
+                        or "melody" in (t.name or "").lower()
+                    ),
+                    None,
+                )
+                if melody_trk and melody_trk.notes:
+                    main_hook_notes = [
+                        {
+                            "pitch": n.pitch,
+                            "start_beat": n.start_beat,
+                            "duration_beats": n.duration_beats,
+                            "velocity": n.velocity,
+                        }
+                        for n in melody_trk.notes[:6]
+                    ]
+            if main_hook_notes:
+                logger.info(
+                    f"[Phase1] main_hook motif "
+                    f"({len(main_hook_notes)} notes) established"
+                )
+
             # Round 2 Phase A: multi-engine reference fanout.
             # The Synthesizer embeds a per-engine note split as a
             # `draft_perspectives` JSON block so the Composer can see
@@ -1402,6 +1439,25 @@ class MusicGenerationPipeline:
                 for si, sec in enumerate(enriched_sections):
                     prev_summary = _previous_section_summary(
                         all_tracks, completed,
+                    )
+
+                    # Bug E: real neighbor-section context. Last ~8 beats
+                    # of every track in the previous section + the shared
+                    # main-hook motif (only injected in verse/chorus/
+                    # pre_chorus — intro/outro/bridge stay free to
+                    # contrast).
+                    last_sec_done = completed[-1] if completed else None
+                    prev_tail_text = (
+                        format_section_tail_for_composer(
+                            extract_section_tail(
+                                all_tracks, last_sec_done,
+                            ),
+                            last_sec_done,
+                        )
+                        if last_sec_done else ""
+                    )
+                    hook_text = format_main_hook_for_composer(
+                        main_hook_notes, sec["name"],
                     )
 
                     sec_spotlight = _get_spotlight_for_section(
@@ -1513,6 +1569,8 @@ class MusicGenerationPipeline:
                         draft_perspectives=(
                             draft_perspectives if rnd == 1 else None
                         ),
+                        previous_section_tail=prev_tail_text,
+                        main_hook=hook_text,
                     )
 
                     comp_resp = await self._call_agent(
