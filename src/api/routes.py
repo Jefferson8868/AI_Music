@@ -15,7 +15,7 @@ from loguru import logger
 from src.api.schemas import GenerateRequest, GenerateResponse, JobStatus, HealthResponse
 from src.agents.pipeline import MusicGenerationPipeline
 from src.llm.client import create_llm_client
-from src.engine.magenta_engine import create_engine
+from src.engine.factory import create_engine, engine_status_report
 from config.settings import settings
 
 router = APIRouter()
@@ -25,15 +25,39 @@ _jobs: dict[str, JobStatus] = {}
 
 @router.get("/health", response_model=HealthResponse)
 async def health_check():
-    engine = create_engine()
-    engine_ok = await engine.health_check()
-    await engine.close()
+    """Health probe with full Round 2 status surface.
+
+    The legacy `music_engine_available` reflects only the primary engine
+    (`settings.music_engine`). The new `reference_engine_status` mirrors
+    the multi-engine fanout from `settings.reference_engines` so client
+    scripts (e.g. `scripts/generate_chi_ling_explicit.py`) can see at a
+    glance which reference engines actually loaded vs. silently fell
+    back to NullEngine.
+    """
+    engine = create_engine(settings.music_engine)
+    try:
+        engine_ok = await engine.health_check()
+    except Exception:
+        engine_ok = False
+    finally:
+        try:
+            await engine.close()
+        except Exception:
+            pass
+    spec = settings.reference_engines or settings.music_engine
+    ref_report = engine_status_report(spec)
     return HealthResponse(
         status="ok",
         llm_backend=settings.llm_backend,
         llm_model=settings.llm_model,
         music_engine=settings.music_engine,
         music_engine_available=engine_ok,
+        reference_engines=spec,
+        reference_engine_status=ref_report,
+        humanize=settings.humanize,
+        render_audio=settings.render_audio,
+        synthesize_vocals=settings.synthesize_vocals,
+        apply_mix=settings.apply_mix,
     )
 
 

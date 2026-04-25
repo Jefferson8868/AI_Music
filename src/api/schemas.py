@@ -38,3 +38,13 @@ class HealthResponse(BaseModel):
     llm_model: str = ""
     music_engine: str = ""
     music_engine_available: bool = False
+    # Round 2 Phase A — per-engine availability so generate scripts can
+    # probe the server before submitting a long-running job and surface
+    # any silently-skipped reference engines to the user.
+    reference_engines: str = ""
+    reference_engine_status: dict[str, dict] = Field(default_factory=dict)
+    # Round 2 Phase C/D/E/F status flags.
+    humanize: bool = False
+    render_audio: bool = False
+    synthesize_vocals: bool = False
+    apply_mix: bool = False

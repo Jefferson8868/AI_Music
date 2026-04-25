@@ -29,12 +29,87 @@ backwards compatibility, but the real dispatch lives here.
 
 from __future__ import annotations
 
+import os
+import sys
+from pathlib import Path
 from typing import Iterable
 
 from loguru import logger
 
 from config.settings import settings
 from src.engine.interface import MusicEngineInterface
+
+
+# ---------------------------------------------------------------------------
+# Reference-engine clone path auto-discovery (Round 2 Phase A)
+# ---------------------------------------------------------------------------
+# When users follow `colab_setup.ipynb` Step 5, reference engines are
+# cloned to `/content/ref_engines/{figaro,mmt,composers-assistant-REAPER}`
+# and the notebook adds those to `os.environ['PYTHONPATH']`. That env-var
+# only lives in the notebook process — when the user later spawns a
+# fresh shell (`/content/AI_Music# python -m src.main`), the engines can
+# no longer be found.
+#
+# Fix: walk well-known clone locations at import time and prepend any
+# that exist to `sys.path`, so the lazy import in each wrapper works
+# regardless of how the server was launched. Also honour an explicit
+# MG_REFERENCE_ENGINES_PATH env var as an override (os.pathsep-separated).
+
+_DEFAULT_CLONE_ROOTS: tuple[Path, ...] = (
+    Path("/content/ref_engines"),
+    Path.cwd() / "ref_engines",
+    Path(__file__).resolve().parent.parent.parent / "ref_engines",
+    Path.home() / "ref_engines",
+)
+
+_CLONE_SUBDIRS: tuple[str, ...] = (
+    # Each well-known clone target — both the parent dir and the clone
+    # itself need to be on sys.path so `import figaro` finds the package
+    # and inner imports resolve.
+    "figaro",
+    "mmt",
+    "MMT-BERT",
+    "composers-assistant-REAPER",
+    "composers_assistant2",
+    "composers_assistant",
+)
+
+
+def _inject_clone_paths() -> list[str]:
+    """Prepend known reference-engine clone locations to `sys.path`.
+
+    Returns the list of paths that were actually injected (for logging).
+    Idempotent — paths already present are skipped.
+    """
+    injected: list[str] = []
+    extra_roots: list[Path] = []
+    if env := os.environ.get("MG_REFERENCE_ENGINES_PATH"):
+        extra_roots.extend(
+            Path(p) for p in env.split(os.pathsep) if p
+        )
+    candidates: list[Path] = []
+    for root in (*extra_roots, *_DEFAULT_CLONE_ROOTS):
+        if not root.is_dir():
+            continue
+        candidates.append(root)
+        for sub in _CLONE_SUBDIRS:
+            child = root / sub
+            if child.is_dir():
+                candidates.append(child)
+    for path in candidates:
+        s = str(path)
+        if s not in sys.path:
+            sys.path.insert(0, s)
+            injected.append(s)
+    return injected
+
+
+_INJECTED_PATHS: list[str] = _inject_clone_paths()
+if _INJECTED_PATHS:
+    logger.debug(
+        "[engine.factory] reference-engine clone paths injected: "
+        + ", ".join(_INJECTED_PATHS)
+    )
 
 
 def create_engine(
@@ -166,3 +241,89 @@ def _build_multi(
     from src.engine.multi_engine import MultiEngine
     engines = [_build_single(n) for n in names]
     return MultiEngine(engines=engines, strategy=strategy)
+
+
+# ---------------------------------------------------------------------------
+# Engine availability report (used by /api/health and src/main.py startup)
+# ---------------------------------------------------------------------------
+
+def engine_status_report(spec: str | None = None) -> dict[str, dict]:
+    """Build a per-engine availability map for a given fanout spec.
+
+    Returns
+    -------
+    dict mapping engine name -> {
+        "type":      class name of the engine actually constructed
+                     ("MagentaEngine", "MusicLangEngine", "NullEngine", ...).
+        "available": bool — True when the wrapper imported its backend
+                     and is NOT a NullEngine.
+        "reason":    str — human-readable explanation when unavailable
+                     (typically the original ImportError message).
+    }
+
+    No network calls; no model loads. Just attempts the lazy import each
+    wrapper does in __init__ and reports the result. Safe to call from
+    a startup hook, /api/health, or a one-shot CLI probe.
+
+    `spec` may be the same value `create_engine` accepts (single name,
+    comma-list, or "multi:..."). When None, reads
+    `settings.reference_engines`.
+    """
+    raw = (spec or settings.reference_engines or "magenta").strip()
+    if raw.startswith("multi:"):
+        raw = raw.split(":", 1)[1]
+    names = [n.strip() for n in raw.split(",") if n.strip()]
+    if not names:
+        names = ["magenta"]
+
+    report: dict[str, dict] = {}
+    for name in names:
+        engine = _build_single(name)
+        type_name = type(engine).__name__
+        # NullEngine carries the failure reason in its `reason` attr.
+        reason = getattr(engine, "reason", "") or ""
+        report[name] = {
+            "type": type_name,
+            "available": type_name != "NullEngine",
+            "reason": str(reason),
+        }
+        # Best-effort cleanup; engines that aren't async-aware skip this.
+        close = getattr(engine, "close", None)
+        if callable(close):
+            try:
+                import asyncio
+                if asyncio.iscoroutinefunction(close):
+                    # Don't block — only schedule if a loop is running.
+                    try:
+                        loop = asyncio.get_running_loop()
+                        loop.create_task(close())
+                    except RuntimeError:
+                        pass
+                else:
+                    close()
+            except Exception:
+                pass
+    return report
+
+
+def format_engine_status(
+    report: dict[str, dict],
+    *,
+    indent: str = "  ",
+) -> str:
+    """Render an engine_status_report() dict as a human log block."""
+    if not report:
+        return f"{indent}(no engines configured)"
+    lines = []
+    for name, info in report.items():
+        mark = "✓" if info.get("available") else "✗"
+        type_name = info.get("type", "?")
+        if info.get("available"):
+            lines.append(f"{indent}{mark} {name:22s} -> {type_name}")
+        else:
+            reason = info.get("reason", "").splitlines()[0] if info.get("reason") else ""
+            tail = f" ({reason})" if reason else ""
+            lines.append(
+                f"{indent}{mark} {name:22s} -> {type_name}{tail}"
+            )
+    return "\n".join(lines)

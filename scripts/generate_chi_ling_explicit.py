@@ -1,6 +1,8 @@
-import os
-import requests
 import json
+import os
+import sys
+
+import requests
 
 # ---------------------------------------------------------------------------
 # Reference-engine selection
@@ -18,14 +20,90 @@ import json
 # and (b) it's the weakest engine for minor-key Chinese pentatonic material.
 # Engines without local weights degrade to NullEngine silently.
 #
-# NOTE: MG_REFERENCE_ENGINES must be set in the SERVER's environment at
-# startup.  Setting it here only takes effect if the server is launched
-# from this same shell.  If your API server is already running, kill it
-# and restart it:
+# IMPORTANT: this script ONLY POSTs to the running API.  MG_REFERENCE_ENGINES
+# is read by the SERVER process at startup, NOT by this script — setting
+# it here would have done nothing (the server has already imported its
+# settings).  Instead we probe /api/health below and warn loudly if the
+# desired engines are not actually loaded.  To change the fanout:
+#
 #     export MG_REFERENCE_ENGINES="musiclang,figaro,composers_assistant"
-#     python -m src.main
+#     python -m src.main           # restart server with new env
 # ---------------------------------------------------------------------------
-os.environ["MG_REFERENCE_ENGINES"] = "musiclang,figaro,composers_assistant"
+DESIRED_REFERENCE_ENGINES = (
+    os.environ.get("MG_REFERENCE_ENGINES")
+    or "musiclang,figaro,composers_assistant"
+)
+
+API_BASE = os.environ.get("MG_API_BASE", "http://localhost:8000")
+
+
+def _preflight_engine_check() -> None:
+    """Probe /api/health and warn if the server's fanout does not match.
+
+    Exits with a clear error message if the server is not reachable —
+    saves the user a 40-minute timeout on the actual /api/generate POST.
+    """
+    try:
+        r = requests.get(f"{API_BASE}/api/health", timeout=5)
+        r.raise_for_status()
+    except Exception as exc:
+        print(
+            f"ERROR: Cannot reach the Music Generator API at {API_BASE}.\n"
+            f"  ({exc})\n"
+            f"Start it with:  python -m src.main\n"
+            f"  (run from the AI_Music project root with the right env)",
+            file=sys.stderr,
+        )
+        sys.exit(2)
+
+    health = r.json()
+    server_spec = health.get("reference_engines", "(unknown)")
+    status = health.get("reference_engine_status", {}) or {}
+    available = [n for n, info in status.items() if info.get("available")]
+    fallback = [n for n, info in status.items() if not info.get("available")]
+
+    print(f"\n=== Server health ({API_BASE}) ===")
+    print(f"  LLM:                {health.get('llm_backend')} / "
+          f"{health.get('llm_model')}")
+    print(f"  Reference engines:  {server_spec}")
+    if available:
+        print(f"    ✓ Loaded:        {', '.join(available)}")
+    if fallback:
+        print(f"    ✗ NullEngine:    {', '.join(fallback)}")
+        for name in fallback:
+            reason = status[name].get("reason", "").splitlines()[0]
+            if reason:
+                print(f"        ↳ {name}: {reason}")
+    print(f"  humanize={health.get('humanize')}, "
+          f"render_audio={health.get('render_audio')}, "
+          f"synthesize_vocals={health.get('synthesize_vocals')}, "
+          f"apply_mix={health.get('apply_mix')}")
+
+    desired = {n.strip() for n in DESIRED_REFERENCE_ENGINES.split(",")
+               if n.strip()}
+    actually_loaded = set(available)
+    missing = desired - actually_loaded
+    if missing:
+        print(
+            f"\nWARNING: This script targets the 赤伶 fanout "
+            f"{sorted(desired)}, but the server only loaded "
+            f"{sorted(actually_loaded)}.\n"
+            f"         Missing engines will fall back to NullEngine and "
+            f"contribute no reference notes.\n"
+            f"         To fix:  install the missing pip packages or clone "
+            f"the repos under /content/ref_engines/ (see "
+            f"`colab_setup.ipynb` Step 5), then restart the server with:\n"
+            f"           export MG_REFERENCE_ENGINES="
+            f"\"{DESIRED_REFERENCE_ENGINES}\"\n"
+            f"           python -m src.main\n"
+        )
+        # Continue anyway — the user may want to test with whatever
+        # engines did load.  Set MG_STRICT_PREFLIGHT=1 to abort instead.
+        if os.environ.get("MG_STRICT_PREFLIGHT") == "1":
+            sys.exit(3)
+
+
+_preflight_engine_check()
 
 
 DESCRIPTION = """
@@ -149,14 +227,17 @@ AVOID (common failure modes)
 
 
 print("Generating 赤伶-style Guofeng opera-pop music...")
-print(f"  MG_REFERENCE_ENGINES = {os.environ['MG_REFERENCE_ENGINES']}")
-print("  (reminder: set the same var in the server shell before "
-      "`python -m src.main`)")
-print("  Per-section composer, may take 5-10 minutes.\n")
+print(f"  Desired MG_REFERENCE_ENGINES = {DESIRED_REFERENCE_ENGINES}")
+print("  (server-side env; set in the shell that runs `python -m src.main`)")
+print(
+    "  Round 2 active: drum/bass/transition agents, MIDI humanizer, "
+    "FluidSynth render, optional vocal stem, pedalboard mix bus."
+)
+print("  Per-section composer + render + mix can take 8-15 minutes.\n")
 
 
 response = requests.post(
-    "http://localhost:8000/api/generate",
+    f"{API_BASE}/api/generate",
     json={
         "request": {
             "description": DESCRIPTION.strip(),
